@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 from pypdf import PdfReader
 from pypdf.generic import ArrayObject
 
+from skill_provenance import require_isolated_runtime
+
 
 def page_reference_map(reader: PdfReader) -> dict[tuple[int, int], int]:
     result: dict[tuple[int, int], int] = {}
@@ -79,6 +81,17 @@ def valid_uri(value: str) -> bool:
     if parsed.scheme == "mailto":
         return "@" in parsed.path
     return False
+
+
+def pdf_version_manifest(reader: PdfReader) -> dict[str, str | None]:
+    root = reader.trailer.get("/Root")
+    if hasattr(root, "get_object"):
+        root = root.get_object()
+    catalog_version = root.get("/Version") if root else None
+    return {
+        "header": reader.pdf_header,
+        "catalog": str(catalog_version) if catalog_version is not None else None,
+    }
 
 
 def validate_links(reader: PdfReader, manifest: list[dict]) -> tuple[list[str], list[str]]:
@@ -161,12 +174,17 @@ def pixel_compare(
 
 
 def verify(args: argparse.Namespace) -> dict:
+    runtime_provenance = require_isolated_runtime()
     source_path = Path(args.source).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     if not source_path.is_file() or not output_path.is_file():
         raise FileNotFoundError("Source and output PDFs must exist")
     source = PdfReader(source_path, strict=False)
     output = PdfReader(output_path, strict=False)
+    source_pdf_version = pdf_version_manifest(source)
+    output_pdf_version = pdf_version_manifest(output)
+    if source_pdf_version != output_pdf_version:
+        raise RuntimeError(f"PDF version changed: {source_pdf_version} -> {output_pdf_version}")
     if len(source.pages) != len(output.pages):
         raise RuntimeError(f"Page count changed: {len(source.pages)} -> {len(output.pages)}")
     page_count = len(source.pages)
@@ -211,6 +229,8 @@ def verify(args: argparse.Namespace) -> dict:
         "output": str(output_path),
         "verification_mode": "structural+pixel" if compared_pages else "structural",
         "deep_content_check": bool(args.deep_content_check),
+        "skill_provenance": runtime_provenance,
+        "pdf_version": output_pdf_version,
         "pages": page_count,
         "links": dict(counts),
         "link_warnings": link_warnings,
@@ -227,7 +247,7 @@ def verify(args: argparse.Namespace) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("source", help="Original static PDF")
     parser.add_argument("output", help="Interactive PDF to verify")
     parser.add_argument("--require-internal", action="store_true", help="Fail if no internal links exist")

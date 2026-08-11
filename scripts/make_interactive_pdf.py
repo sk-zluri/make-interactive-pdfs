@@ -17,6 +17,8 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import ArrayObject, Fit, NumberObject
 
+from skill_provenance import require_isolated_runtime
+
 
 TOC_HEADINGS = ("table of contents", "contents", "agenda", "index")
 PAGE_TOKEN_RE = re.compile(r"^[\s.·•()\[\]-]*([0-9]{1,4}|[ivxlcdm]{1,10})[\s.·•()\[\]-]*$", re.I)
@@ -381,7 +383,19 @@ def default_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem} - Interactive.pdf")
 
 
+def pdf_version_manifest(reader: PdfReader) -> dict[str, str | None]:
+    root = reader.trailer.get("/Root")
+    if hasattr(root, "get_object"):
+        root = root.get_object()
+    catalog_version = root.get("/Version") if root else None
+    return {
+        "header": reader.pdf_header,
+        "catalog": str(catalog_version) if catalog_version is not None else None,
+    }
+
+
 def make_interactive(args: argparse.Namespace) -> dict:
+    runtime_provenance = require_isolated_runtime()
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
@@ -512,7 +526,11 @@ def make_interactive(args: argparse.Namespace) -> dict:
             added.append(link)
             occupied[link.source_page].append(link.rect)
 
+    source_pdf_version = pdf_version_manifest(reader)
     writer = PdfWriter(clone_from=reader)
+    # PdfWriter otherwise defaults cloned documents to %PDF-1.3, which can
+    # under-declare artwork features such as transparency and soft masks.
+    writer.pdf_header = reader.pdf_header
     borderless = ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)])
     for link in added:
         if link.kind == "internal":
@@ -530,6 +548,9 @@ def make_interactive(args: argparse.Namespace) -> dict:
         writer.write(handle)
 
     result = PdfReader(output_path, strict=False)
+    output_pdf_version = pdf_version_manifest(result)
+    if output_pdf_version != source_pdf_version:
+        raise RuntimeError(f"PDF version changed: {source_pdf_version} -> {output_pdf_version}")
     if len(result.pages) != page_count:
         raise RuntimeError("Output page count changed")
     for index, (source_page, result_page) in enumerate(zip(reader.pages, result.pages, strict=True), start=1):
@@ -562,6 +583,8 @@ def make_interactive(args: argparse.Namespace) -> dict:
         "output": str(output_path),
         "output_mode": output_mode,
         "mode": mode,
+        "skill_provenance": runtime_provenance,
+        "pdf_version": output_pdf_version,
         "pages": page_count,
         "toc_pages": [page + 1 for page in sorted(toc_pages)],
         "detected_page_offset": detected_offset,
@@ -586,7 +609,7 @@ def make_interactive(args: argparse.Namespace) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("input", help="Source PDF; never overwritten")
     parser.add_argument("--output", help="Output PDF (default: '<stem> - Interactive.pdf')")
     parser.add_argument(

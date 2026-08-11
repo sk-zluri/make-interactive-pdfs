@@ -37,7 +37,7 @@ Typical OCR-first flow:
 
 ```powershell
 ocrmypdf --skip-text input.pdf searchable.pdf
-python scripts/make_interactive_pdf.py searchable.pdf
+python scripts/run_isolated.py make searchable.pdf
 ```
 
 If a known-good interactive PDF has the same page count, dimensions, and layout as the compressed or flattened source, prefer `--reference-pdf`. This copies the verified link rectangles and destinations without OCR and is the safest way to restore interactivity lost during optimization.
