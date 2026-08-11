@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -94,7 +95,7 @@ def verify(args: argparse.Namespace) -> dict:
         render_dir = (
             Path(args.render_dir).expanduser().resolve()
             if args.render_dir
-            else output_path.with_name(f"{output_path.stem}-verification")
+            else Path(tempfile.mkdtemp(prefix="interactive-pdf-verification-"))
         )
         render_dir.mkdir(parents=True, exist_ok=True)
         source_doc = pymupdf.open(source_path)

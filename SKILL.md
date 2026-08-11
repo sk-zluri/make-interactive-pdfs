@@ -10,18 +10,28 @@ Turn a static PDF into a linked copy while preserving its pages, text, dimension
 ## Workflow
 
 1. Preserve the source PDF. Never overwrite it.
-2. Install Python dependencies from `requirements.txt`.
-3. Run `scripts/make_interactive_pdf.py` with a new output path.
-4. Review the printed detection report. Resolve any unmapped or ambiguous TOC rows with the CLI overrides.
-5. Run `scripts/verify_interactive_pdf.py` against the source and result.
-6. Render and visually inspect the cover, every detected navigation page, and representative destinations.
-7. Open the exact output PDF in Chrome or Acrobat and click at least two internal links and one external link when present.
+2. Unless the user already specified placement, present exactly these two output choices before processing:
+   - **PDF beside source**: create only `<source stem> - Interactive.pdf` in the source directory.
+   - **Output folder + link report**: create an `output` folder beside the source containing `<source stem> - Interactive.pdf` and `<source stem> - Link Report.json`.
+3. Install Python dependencies from `requirements.txt`.
+4. Run `scripts/make_interactive_pdf.py` using the selected output mode.
+5. Review the printed detection report. Resolve any unmapped or ambiguous TOC rows with the CLI overrides.
+6. Run `scripts/verify_interactive_pdf.py` against the source and result.
+7. Render and visually inspect the cover, every detected navigation page, and representative destinations. Keep verification PNGs in the verifier's temporary directory, never in either user deliverable location, and remove them after inspection.
+8. Open the exact output PDF in Chrome or Acrobat and click at least two internal links and one external link when present.
 
 ## Quick Start
 
 ```powershell
 python -m pip install -r requirements.txt
-python scripts/make_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" --report-json "D:\PDF\PATH\HERE\test-link-report.json"
+
+# Choice A: PDF beside source; no JSON report
+python scripts/make_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" --output-mode root
+
+# Choice B: output folder containing the PDF and JSON report
+python scripts/make_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" --output-mode folder
+
+# Verification renders go to a system temporary directory by default
 python scripts/verify_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --render-pages auto
 ```
 
@@ -65,6 +75,8 @@ python scripts/make_interactive_pdf.py input.pdf --output output.pdf --force
 
 Use `--toc-pages` and `--page-offset` together when the document has unusual numbering. Physical PDF pages and CLI page numbers are 1-based; internal script indices are 0-based.
 
+Treat `--output` and `--report-json` as advanced overrides. Do not create `output/pdf`, a verification directory beside the final PDF, or a link-report JSON for the root output choice.
+
 ## Acceptance Criteria
 
 Do not declare completion unless:
@@ -76,6 +88,7 @@ Do not declare completion unless:
 - Render comparison shows no artwork changes.
 - Click testing reaches the expected physical PDF pages.
 - The final output path, link counts, unresolved rows, and verification results are reported to the user.
+- The user-facing deliverable contains only the artifacts promised by the selected output choice.
 
 If compression is also required, compress the static artwork first and add link annotations last. Some PDF optimizers discard annotations.
 

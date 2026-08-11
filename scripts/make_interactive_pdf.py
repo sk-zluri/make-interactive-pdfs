@@ -383,9 +383,19 @@ def default_output_path(input_path: Path) -> Path:
 
 def make_interactive(args: argparse.Namespace) -> dict:
     input_path = Path(args.input).expanduser().resolve()
-    output_path = Path(args.output).expanduser().resolve() if args.output else default_output_path(input_path)
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
+    if args.output and args.output_mode:
+        raise ValueError("Use either --output or --output-mode, not both")
+    if args.output:
+        output_mode = "custom"
+        output_path = Path(args.output).expanduser().resolve()
+    elif args.output_mode == "folder":
+        output_mode = "folder"
+        output_path = input_path.parent / "output" / f"{input_path.stem} - Interactive.pdf"
+    else:
+        output_mode = "root"
+        output_path = default_output_path(input_path)
     if input_path == output_path:
         raise ValueError("Output must differ from the source PDF")
     if output_path.exists() and not args.force:
@@ -550,6 +560,7 @@ def make_interactive(args: argparse.Namespace) -> dict:
     report = {
         "input": str(input_path),
         "output": str(output_path),
+        "output_mode": output_mode,
         "mode": mode,
         "pages": page_count,
         "toc_pages": [page + 1 for page in sorted(toc_pages)],
@@ -562,8 +573,12 @@ def make_interactive(args: argparse.Namespace) -> dict:
         "warnings": warnings,
         "links": [asdict(link) for link in added],
     }
+    report_path = None
     if args.report_json:
         report_path = Path(args.report_json).expanduser().resolve()
+    elif output_mode == "folder":
+        report_path = output_path.parent / f"{input_path.stem} - Link Report.json"
+    if report_path is not None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(report_path)
@@ -574,6 +589,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Source PDF; never overwritten")
     parser.add_argument("--output", help="Output PDF (default: '<stem> - Interactive.pdf')")
+    parser.add_argument(
+        "--output-mode",
+        choices=("root", "folder"),
+        help="root: PDF beside source; folder: output directory with PDF and link report",
+    )
     parser.add_argument("--toc-pages", help="Comma-separated 1-based TOC/agenda/index pages")
     parser.add_argument("--page-offset", type=int, help="Physical PDF page minus printed page label")
     parser.add_argument(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,8 @@ def main() -> int:
                 "--require-external",
                 "--render-pages",
                 "auto",
+                "--render-dir",
+                str(temp_dir / "verification"),
             ]
         )
         data = json.loads(report.read_text(encoding="utf-8"))
@@ -109,6 +112,44 @@ def main() -> int:
                 "--require-external",
             ]
         )
+
+        root_source = temp_dir / "root-choice.pdf"
+        shutil.copy2(source, root_source)
+        run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "make_interactive_pdf.py"),
+                str(root_source),
+                "--output-mode",
+                "root",
+                "--strict",
+            ]
+        )
+        root_output = temp_dir / "root-choice - Interactive.pdf"
+        if not root_output.is_file():
+            raise RuntimeError("Root output mode did not create the expected PDF")
+        if list(temp_dir.glob("root-choice*Link Report.json")):
+            raise RuntimeError("Root output mode unexpectedly created a link report")
+
+        folder_source = temp_dir / "folder-choice.pdf"
+        shutil.copy2(source, folder_source)
+        run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "make_interactive_pdf.py"),
+                str(folder_source),
+                "--output-mode",
+                "folder",
+                "--strict",
+            ]
+        )
+        folder_output = temp_dir / "output" / "folder-choice - Interactive.pdf"
+        folder_report = temp_dir / "output" / "folder-choice - Link Report.json"
+        if not folder_output.is_file() or not folder_report.is_file():
+            raise RuntimeError("Folder output mode did not create the expected PDF and report")
+        folder_files = sorted(path.name for path in (temp_dir / "output").iterdir())
+        if folder_files != [folder_output.name, folder_report.name]:
+            raise RuntimeError(f"Folder output mode created unexpected artifacts: {folder_files}")
     print("SELF TEST PASS")
     return 0
 
