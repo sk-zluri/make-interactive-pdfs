@@ -1,0 +1,4 @@
+interface:
+  display_name: "Make Interactive PDFs"
+  short_description: "Automatically link TOCs and URLs in PDFs"
+  default_prompt: "Use $make-interactive-pdfs to analyze this PDF and add working internal TOC links and external URL links."
