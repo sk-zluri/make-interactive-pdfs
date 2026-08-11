@@ -1,46 +1,43 @@
-# Dependencies
+# Dependencies and runtime
 
-The default linker and structural verifier require Python 3.10 or newer. Always use `scripts/run_isolated.py`; it creates `.venv` inside the skill checkout, installs only the required profile there, and reuses it while the requirements hash is unchanged.
+Python 3.10 or newer is required. Always call `scripts/run_isolated.py`; the low-level linker and verifier reject direct execution.
 
-- Python: https://www.python.org/downloads/
+The runner creates `.venv` inside the checkout by default, disables system site packages and user installs, validates checkout ownership, verifies installed versions against every exact release pin, and atomically records requirement stamps. Production `make`/`verify` commands retain the environment lock for their full run so another profile cannot mutate dependencies mid-process. It never installs into system, shared, or agent Python environments.
+
+Core libraries:
+
 - pypdf: https://pypdf.readthedocs.io/
 - pdfplumber: https://github.com/jsvine/pdfplumber
+- pdfminer.six: https://pdfminersix.readthedocs.io/
+- pypdfium2: https://pypdfium2.readthedocs.io/
 
-Run the default workflow with:
-
-```powershell
-python scripts/run_isolated.py make "D:\PDF\PATH\HERE\test.pdf" --output-mode root
-python scripts/run_isolated.py verify "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal
-```
-
-Never run `pip install` against the system interpreter, a shared tool environment, or the agent's own environment. The low-level linker and verifier reject direct execution. If the skill checkout is read-only, place the dedicated environment elsewhere by putting `--venv-dir PATH` before `make` or `verify`; an existing environment is accepted only when it carries this skill's matching ownership marker and disables system site packages.
+If the checkout is read-only, put `--venv-dir PATH` before `make` or `verify`. A reusable environment must carry the matching skill ownership marker, checkout path, and disabled-system-site configuration.
 
 ## Repository provenance
 
-When the user supplies a GitHub URL, use a clean checkout from that URL and verify it before processing:
+When the user supplies a GitHub URL, use a fresh clone of that exact URL and pass it to the runner:
 
 ```powershell
-python scripts/skill_provenance.py --expect-repository "https://github.com/sk-zluri/make-interactive-pdfs" --require-git --require-clean
+python scripts/run_isolated.py `
+  --expect-repository "https://github.com/sk-zluri/make-interactive-pdfs" `
+  --require-clean `
+  make "D:\PDF\PATH\HERE\test.pdf" --output-mode root
 ```
 
-The provenance check also requires local `HEAD` to match the commit advertised by the repository's remote `HEAD`. Its report includes the isolated-runtime profile, skill version, canonical and actual repository URLs, full Git commit, dirty state, per-file hashes, and one combined bundle hash. Generation and verification reports embed the same provenance data.
+The runner performs one online remote-HEAD acquisition check, pins the full local commit for that process, then uses local repository/commit/clean/bundle checks during environment setup and PDF processing. A remote update during a long run does not invalidate the already acquired commit.
 
-Also pass `--expect-repository URL` and the captured `--expect-commit FULL_SHA` before every `make` and `verify`. The isolated runner checks before environment setup, immediately before launch, and after processing; it fails on a missing/mismatched Git checkout, unpublished/non-current commit, or dirty worktree.
+Reports include the canonical/actual repository, full Git commit, clean state, complete release bundle hash, per-file hashes, Python version, and resolved package versions.
 
-## Optional pixel comparison
+## Optional verification
 
-Pixel comparison uses PyMuPDF and runs entirely in memory unless `--save-renders` is supplied. The isolated runner selects `requirements-pixel.txt` automatically.
-
-- PyMuPDF: https://pymupdf.readthedocs.io/
+Pixel comparison adds the pinned PyMuPDF profile and runs in memory unless `--save-renders` is explicitly requested:
 
 ```powershell
 python scripts/run_isolated.py verify source.pdf output.pdf --pixel-compare auto
 ```
 
-## Optional live-viewer verification
+Browser automation is unnecessary for generation and normal verification. Use a live viewer only for explicit user-requested proof or manual approval of ambiguous mappings.
 
-Browser automation is not required for normal generation or verification. Use it only when the user explicitly requests proof that a particular PDF viewer responds to real clicks.
+- Browser Harness: https://github.com/browser-use/browser-harness
 
-- browser-harness: https://github.com/browser-use/browser-harness
-
-Alternatively, open the PDF manually in Chrome or Adobe Acrobat and click representative links. Structural verification through `scripts/run_isolated.py verify` remains the default acceptance check.
+OCR is not a normal dependency and must never be installed system-wide by the skill. See [heuristics-and-limitations.md](heuristics-and-limitations.md) for the targeted review workflow.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -17,15 +18,22 @@ from urllib.parse import urlsplit
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_REPOSITORY = "https://github.com/sk-zluri/make-interactive-pdfs"
-PROVENANCE_FILES = (
+REQUIRED_RELEASE_FILES = (
+    ".gitignore",
     "VERSION",
     "SKILL.md",
     "requirements.txt",
     "requirements-pixel.txt",
+    "requirements-dev.txt",
+    "agents/openai.yaml",
+    "references/dependencies.md",
+    "references/heuristics-and-limitations.md",
     "scripts/make_interactive_pdf.py",
     "scripts/verify_interactive_pdf.py",
     "scripts/run_isolated.py",
     "scripts/skill_provenance.py",
+    "tests/self_test.py",
+    "tests/regression_test.py",
 )
 FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
 GITHUB_SCP_RE = re.compile(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?$", re.I)
@@ -98,12 +106,32 @@ def git_output(skill_root: Path, *arguments: str) -> str | None:
 
 
 def file_hashes(skill_root: Path) -> dict[str, str]:
+    missing = [relative for relative in REQUIRED_RELEASE_FILES if not (skill_root / relative).is_file()]
+    if missing:
+        raise RuntimeError(f"Skill release is missing required files: {missing}")
     hashes: dict[str, str] = {}
-    for relative in PROVENANCE_FILES:
-        path = skill_root / relative
-        if path.is_file():
-            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    release_paths = [skill_root / relative for relative in REQUIRED_RELEASE_FILES]
+    for directory in ("agents", "references", "scripts", "tests"):
+        release_paths.extend(
+            path
+            for path in (skill_root / directory).rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+        )
+    for path in sorted(set(release_paths)):
+        relative = path.relative_to(skill_root).as_posix()
+        hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     return hashes
+
+
+def resolved_package_versions() -> dict[str, str | None]:
+    packages = ("pypdf", "pdfplumber", "pdfminer.six", "pypdfium2", "Pillow", "PyMuPDF")
+    versions: dict[str, str | None] = {}
+    for package in packages:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
 
 
 def combined_hash(hashes: dict[str, str]) -> str:
@@ -159,6 +187,7 @@ def collect_provenance(skill_root: Path = SKILL_ROOT) -> dict:
             "profile": os.environ.get("MAKE_INTERACTIVE_PDFS_PROFILE"),
             "environment": os.environ.get("MAKE_INTERACTIVE_PDFS_ENVIRONMENT"),
             "python": platform.python_version(),
+            "packages": resolved_package_versions(),
         },
     }
 
@@ -200,6 +229,14 @@ def require_isolated_runtime(skill_root: Path = SKILL_ROOT) -> dict:
                 recorded_environment = None
             if recorded_environment != environment:
                 errors.append("The environment ownership marker does not match the active environment")
+            try:
+                recorded_root = Path(str(owner["skill_root"])).expanduser().resolve()
+            except (KeyError, OSError, RuntimeError, ValueError):
+                recorded_root = None
+            if recorded_root != skill_root.resolve():
+                errors.append("The active virtual environment belongs to a different skill checkout")
+            if owner.get("skill_version") != report.get("version"):
+                errors.append("The environment ownership marker has a different skill version")
 
     expected_repository = os.environ.get("MAKE_INTERACTIVE_PDFS_EXPECTED_REPOSITORY")
     expected_commit = os.environ.get("MAKE_INTERACTIVE_PDFS_EXPECTED_COMMIT")
@@ -211,8 +248,12 @@ def require_isolated_runtime(skill_root: Path = SKILL_ROOT) -> dict:
                 expected_commit=expected_commit,
                 require_git=True,
                 require_clean=True,
+                verify_remote_head=False,
             )
         )
+        advertised_head = os.environ.get("MAKE_INTERACTIVE_PDFS_ADVERTISED_HEAD")
+        if advertised_head and (report.get("git_commit") or "").casefold() != advertised_head.casefold():
+            errors.append("The local commit differs from the commit advertised at acquisition time")
     if errors:
         raise RuntimeError("; ".join(dict.fromkeys(errors)))
     return report
@@ -225,6 +266,7 @@ def validate_provenance(
     expected_commit: str | None = None,
     require_git: bool = False,
     require_clean: bool = False,
+    verify_remote_head: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     if require_git and not report["git_commit"]:
@@ -238,7 +280,7 @@ def validate_provenance(
             errors.append("Cannot verify the requested repository without Git metadata")
         elif actual != expected:
             errors.append(f"Repository mismatch: expected {expected!r}, found {actual!r}")
-        else:
+        elif verify_remote_head:
             remote_head = advertised_remote_head(expected)
             report["advertised_remote_head"] = remote_head
             report["remote_head_verified"] = (

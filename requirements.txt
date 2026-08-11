@@ -1,2 +1,9 @@
-pypdf>=6.0,<7
-pdfplumber>=0.11,<1
+pypdf==6.15.0
+pdfplumber==0.11.10
+pdfminer.six==20260107
+pypdfium2==5.12.1
+Pillow==12.3.0
+charset-normalizer==3.4.9
+cryptography==50.0.0
+cffi==2.1.1
+pycparser==3.0

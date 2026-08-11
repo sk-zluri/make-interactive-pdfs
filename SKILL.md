@@ -1,114 +1,125 @@
 ---
 name: make-interactive-pdfs
-description: Analyze existing PDF documents and make them interactive by adding invisible internal links from tables of contents, agendas, indexes, or similar page-reference lists, plus clickable annotations for visible URLs and email addresses. Use for static exported PDFs that need working page jumps or web links, for restoring links lost during PDF compression, or for verifying that an interactive PDF still has correct destinations without changing its visual content.
+description: Analyze existing PDF documents and make them interactive by adding invisible internal links from tables of contents, agendas, indexes, or similar page-reference lists, plus clickable annotations for visible URLs and email addresses. Use for static exported or scanned PDFs that need working page jumps or web links, for restoring links lost during PDF compression, for replaying a reviewed link manifest, or for verifying that links still reach their intended destinations without changing visual content.
 ---
 
 # Make Interactive PDFs
 
-Turn a static PDF into a linked copy while preserving its pages, text, dimensions, and visual appearance. Use the bundled scripts instead of rewriting PDF-annotation logic.
+Use the bundled scripts. They preserve the source, infer separate Roman/Arabic and piecewise pagination ranges, reject uncertain mappings, and publish only validated output.
 
-## Workflow
+## Required workflow
 
-1. Preserve the source PDF. Never overwrite it.
-2. Unless the user already specified placement, present exactly these two output choices before processing:
-   - **PDF beside source**: create only `<source stem> - Interactive.pdf` in the source directory.
-   - **Output folder + link report**: create an `output` folder beside the source containing `<source stem> - Interactive.pdf` and `<source stem> - Link Report.json`.
-3. When the user supplies a skill repository URL, make a fresh Git clone from that exact URL rather than substituting an installed copy. Run `scripts/skill_provenance.py` with `--expect-repository`, `--require-git`, and `--require-clean`; retain its full commit ID in the result.
-4. Use `scripts/run_isolated.py` for generation and verification. It creates and reuses a dedicated `.venv` inside the skill checkout. Never install packages into a system, shared, or agent Python environment. The low-level linker and verifier intentionally refuse direct execution.
-5. Run the `make` command using the selected output mode.
-6. Review the printed detection report. Resolve any unmapped or ambiguous TOC rows with the CLI overrides.
-7. Run the `verify` command against the source and result. This default structural check requires no browser, image rendering, or repeated text extraction; the linker already checks text parity while creating the PDF.
-8. Only when the user requests stronger visual assurance, add `--pixel-compare`; the isolated runner installs the optional dependency, comparison stays in memory, and no PNGs are created.
-9. Only when the user explicitly requests live-viewer proof, use browser-harness or manually click representative links in Chrome or Acrobat.
+1. Never overwrite the source PDF.
+2. Unless the user already chose placement, present exactly:
+   - **PDF beside source**: create only `<source stem> - Interactive.pdf` beside the source.
+   - **Output folder + link report**: create `output` beside the source containing `<source stem> - Interactive.pdf` and `<source stem> - Link Report.json`.
+3. When a repository URL is supplied, clone that exact URL into a fresh directory. Run only that checkout and retain the full commit ID from the report.
+4. Use `scripts/run_isolated.py`. It creates a checkout-owned virtual environment, enforces exact dependency versions, locks it for the full production command, and refuses direct/shared-Python execution.
+5. Run `make` with the chosen output mode. Bare domains are intentionally disabled; explicit `http://`, `https://`, `www.`, and email text remain automatic.
+6. Interpret the exit/status contract:
+   - Exit `0`, `PASS`: validated PDF was atomically published.
+   - Exit `2`, `NEEDS_REVIEW`: ambiguity or incomplete OCR was found; no final PDF was published.
+   - Exit `1`, `FAIL`: processing/runtime failure; no final PDF was published.
+7. For `NEEDS_REVIEW`, inspect `toc_completeness`, `pagination_segments`, `unresolved_toc_rows`, and `review_reasons`. Folder mode writes the review report automatically; after a root-mode review result, rerun with `--report-json` pointing to a task-local work path. Use targeted OCR or direct page inspection only for flagged TOC rows/boundaries. Correct a copy of the report's `links` array, set top-level `reviewed` to `true`, and replay it with `--link-manifest`. Preserve `input_sha256`; source and target page fields are zero-based in manifests.
+8. Run `verify` with `--link-report` whenever a report exists. This checks mandatory source/output hashes, every original and intended annotation one-to-one, exact rectangles and destinations, annotation counts, content streams, visual resource graphs, page geometry, and PDF version.
+9. Use pixel comparison only when stronger visual assurance is requested. Use browser/live-click testing only when explicitly requested or when manually approving uncertain mappings.
 
-## Quick Start
+Never claim completion from a `NEEDS_REVIEW` candidate. Never restore the old physical-page fallback. Never install OCR or browser dependencies system-wide.
+
+Allow command wrappers at least five minutes for first-time dependency setup or large scanned books. The analyzer prints progress every 100 pages; do not launch a duplicate merely because a short wrapper timeout elapsed—check the process and intended output paths first.
+
+## Quick start
 
 ```powershell
-# When a GitHub URL was supplied, verify the exact clean checkout first
 $skillRepository = "https://github.com/sk-zluri/make-interactive-pdfs"
-$skillProvenance = python scripts/skill_provenance.py --expect-repository $skillRepository --require-git --require-clean | ConvertFrom-Json
-$skillCommit = $skillProvenance.git_commit
 
-# Choice A: PDF beside source; no JSON report
-python scripts/run_isolated.py --expect-repository $skillRepository --expect-commit $skillCommit make "D:\PDF\PATH\HERE\test.pdf" --output-mode root
+# Choice A: final PDF beside source
+python scripts/run_isolated.py --expect-repository $skillRepository --require-clean make "D:\PDF\PATH\HERE\test.pdf" --output-mode root
 
-# Choice B: output folder containing the PDF and JSON report
-python scripts/run_isolated.py --expect-repository $skillRepository --expect-commit $skillCommit make "D:\PDF\PATH\HERE\test.pdf" --output-mode folder
+# Choice B: output folder with final PDF and report
+python scripts/run_isolated.py --expect-repository $skillRepository --require-clean make "D:\PDF\PATH\HERE\test.pdf" --output-mode folder
 
-# Default lightweight structural verification
-python scripts/run_isolated.py --expect-repository $skillRepository --expect-commit $skillCommit verify "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal
-
-# Optional in-memory pixel comparison
-python scripts/run_isolated.py --expect-repository $skillRepository --expect-commit $skillCommit verify "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal --pixel-compare auto
-
-# Optional slower repeat of page-by-page extracted-text parity
-python scripts/run_isolated.py --expect-repository $skillRepository --expect-commit $skillCommit verify "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal --deep-content-check
+# Report-backed verification for Choice B
+python scripts/run_isolated.py --expect-repository $skillRepository --require-clean verify `
+  "D:\PDF\PATH\HERE\test.pdf" `
+  "D:\PDF\PATH\HERE\output\test - Interactive.pdf" `
+  --link-report "D:\PDF\PATH\HERE\output\test - Link Report.json" `
+  --require-internal
 ```
 
-If the user did not supply a repository URL, omit both repository/commit variables and both `--expect-*` options; reports still include the packaged skill version and bundle hashes.
+If no repository URL was supplied, omit `--expect-repository` and `--require-clean`. Reports still contain the packaged version, complete bundle hash, runtime packages, and checkout state. Use `python3` and native paths on macOS/Linux.
 
-On macOS or Linux, use the same commands with native paths and `python3` if required.
+## Safe review and replay
 
-## Detection Behavior
+The automatic analyzer returns `NEEDS_REVIEW` for unparseable visual rows, uncovered pagination gaps, conflicting footer labels, ambiguous segments, unresolved titles, or incomplete text layers. It may write a report for repair, but it does not publish a final-named PDF.
 
-The linker automatically:
-
-- Detects TOC-like pages from headings and rows ending in page labels.
-- Infers the offset between printed page numbers and physical PDF pages from header/footer numbering.
-- Falls back to matching TOC titles against page text.
-- Adds invisible full-row internal link annotations.
-- Detects visible `http://`, `https://`, `www.`, bare-domain, and email text and adds URI annotations.
-- Recovers URI annotations whose action was removed but whose destination remains in annotation metadata.
-- Copies all links from a known-good same-layout PDF when `--reference-pdf` is supplied.
-- Preserves existing annotations and skips overlapping links to avoid duplicates.
-- Preserves both the PDF header version and any catalog version override.
-- Verifies PDF version, page count, dimensions, text extraction, and final annotation counts before success.
-- Prints the isolated-runtime profile, skill version, bundle hash, repository URL, full Git commit, and checkout state in every report.
-
-Read [references/heuristics-and-limitations.md](references/heuristics-and-limitations.md) when auto-detection reports ambiguity, scans contain no selectable text, or link labels hide their actual URLs. Read [references/dependencies.md](references/dependencies.md) for core and optional verification dependencies.
-
-## Useful Overrides
+After inspecting only the flagged evidence, make the report complete and replay it:
 
 ```powershell
-# Explicit 1-based TOC pages
+python scripts/run_isolated.py make source.pdf `
+  --link-manifest reviewed-link-report.json `
+  --output-mode folder `
+  --force
+
+python scripts/run_isolated.py verify source.pdf `
+  "output\source - Interactive.pdf" `
+  --link-report "output\source - Link Report.json" `
+  --require-internal
+```
+
+`--link-manifest` accepts a `PASS` v1.2 report or a corrected v1.2 report marked `"reviewed": true`. It requires the report's `input_sha256` to match the source and validates page bounds, rectangles, destinations, URIs, and any overlapping existing links before replay. Do not mark or replay uncertain automatic guesses unchanged. Pre-v1.2 manifests require the explicit `--allow-legacy-manifest` override after independent approval.
+
+## Useful overrides
+
+```powershell
+# Explicit 1-based navigation pages
 python scripts/run_isolated.py make input.pdf --toc-pages 2,3
 
-# Explicit physical-page minus printed-page offset
+# One known offset; piecewise/multi-volume documents should use automatic segments or a manifest
 python scripts/run_isolated.py make input.pdf --page-offset 3
 
-# Restore links after compression from a known-good same-layout PDF
+# Restore annotations from a known-good same-layout PDF
 python scripts/run_isolated.py make compressed.pdf --reference-pdf original-interactive.pdf
 
-# Disable one link class
+# Disable a class
 python scripts/run_isolated.py make input.pdf --no-url-links
 python scripts/run_isolated.py make input.pdf --no-toc-links
 
-# Replace an existing output deliberately
+# Explicitly opt into risky bare-domain detection only when the user requires it
+python scripts/run_isolated.py make input.pdf --allow-bare-domains
+
+# Replace existing deliverables transactionally
 python scripts/run_isolated.py make input.pdf --output output.pdf --force
+
+# Optional in-memory artwork comparison; creates no PNGs
+python scripts/run_isolated.py verify source.pdf output.pdf --pixel-compare auto
+
+# Optional slower extracted-text comparison
+python scripts/run_isolated.py verify source.pdf output.pdf --deep-content-check
 ```
 
-Use `--toc-pages` and `--page-offset` together when the document has unusual numbering. Physical PDF pages and CLI page numbers are 1-based; internal script indices are 0-based.
+Adding annotations invalidates digital signatures. Stop unless the user explicitly authorizes this, then pass `--allow-signature-invalidation`. Password-protected input requires `--password`; the produced copy is decrypted, as stated in CLI help.
 
-Treat `--output` and `--report-json` as advanced overrides. Do not create `output/pdf`, a verification directory beside the final PDF, or a link-report JSON for the root output choice.
+## Detection and performance
 
-## Acceptance Criteria
+The linker extracts word geometry once, groups adjacent TOC pages into blocks, separates Roman and Arabic labels, and infers stable offset segments inside each block. It checks target footer labels and title evidence, never guesses with `printed page = physical page`, and records confidence/evidence for every automatic internal link.
 
-Do not declare completion unless:
+Automatic URL linking excludes bare domains by default because OCR punctuation commonly turns words into false domains. Existing valid annotations are preserved; a replay overlap is covered only when its target page or URI is identical, and conflicting overlaps return `NEEDS_REVIEW`.
 
-- The output has the same page count and page dimensions as the source.
-- The output preserves the source PDF header version and catalog version override.
-- Extracted text matches page by page.
-- Every internal destination resolves to a valid physical PDF page.
-- Every link rectangle has positive area and remains within its source page.
-- Every external link has a valid supported URI.
-- All intended TOC rows have destinations or are explicitly reported as unresolved.
-- Visible URLs are linked or explicitly reported as unsupported.
-- The final output path, link counts, unresolved rows, and verification results are reported to the user.
-- When a repository URL was supplied, provenance reports that exact origin, a full commit ID, and a clean checkout.
-- The user-facing deliverable contains only the artifacts promised by the selected output choice.
+Normal generation does not render pages, run OCR, launch a browser, or repeat extracted-text analysis. Cached content-stream and canonical visual-resource hashes provide lightweight preservation checks without page rendering. Output destinations are locked during processing, and in folder mode the PDF is published before its hash-bound report commit marker. Read [references/heuristics-and-limitations.md](references/heuristics-and-limitations.md) only for scans, ambiguity, manifests, or hidden destinations. Read [references/dependencies.md](references/dependencies.md) for environment and optional-tool details.
 
-If optional pixel comparison is requested, require an exact in-memory artwork match. If optional live-viewer verification is requested, require the tested clicks to reach their expected pages or URLs. Do not install browser-harness or create verification PNGs during the default workflow.
+## Acceptance criteria
 
-If compression is also required, compress the static artwork first and add link annotations last. Some PDF optimizers discard annotations.
+Declare completion only when:
 
-For an image-only PDF, first use OCR as described in [references/heuristics-and-limitations.md](references/heuristics-and-limitations.md), or use `--reference-pdf` when a same-layout interactive version exists.
+- Generation status is `PASS`, never `NEEDS_REVIEW`.
+- The source hash is unchanged and the output differs from the source path.
+- Page count, dimensions, content streams, visual resources/render state, PDF header version, and catalog version are preserved.
+- Every internal destination resolves within the PDF and every rectangle has positive in-page area.
+- Every intended report/manifest link has exactly one matching annotation and destination.
+- No detected or suspected TOC row remains unresolved.
+- External annotations use supported URIs; bare OCR domains were not enabled without explicit need.
+- Repository URL, full commit, clean state, skill version, dependencies, output path, and link counts are reported.
+- The output location contains only the artifacts promised by the selected placement choice.
+
+If compression is required, compress static artwork first and add annotations last. Some optimizers discard annotations.

@@ -1,47 +1,55 @@
-# Heuristics and Limitations
+# Heuristics and limitations
 
-## Automatic TOC detection
+## Contents and pagination
 
-The linker groups words into visual lines and looks for pages containing a TOC-like heading or a dense set of rows whose final token is a page label aligned near the right edge. It supports Arabic and basic Roman page labels.
+The analyzer caches word geometry once, detects TOC-like pages, groups adjacent pages into blocks, and infers pagination only from repeated header/footer evidence inside the content region following each block. Roman and Arabic labels are separate. Stable offset changes become separate segments, which supports volumes, numbering restarts, and scan-page omissions.
 
-It maps printed labels to physical pages by finding a repeated offset in page numbers located near page headers or footers. For example, if printed page 1 is physical PDF page 4, the offset is `3`.
+Rows are accepted only when a stable segment, matching target footer, or strong unique title supports the destination. Uncovered gaps, conflicting footers, multiple plausible targets, and fuzzy-only title matches produce `NEEDS_REVIEW`. There is no physical-page fallback.
 
-When no reliable offset exists, it tries a unique normalized title match against document page text, then falls back to treating the printed label as a physical page number.
+`toc_completeness` compares parsed rows with visual right-column candidates and chapter anchors. A nonzero `suspected_unparsed_toc_rows` means the OCR/text layer likely omitted or corrupted rows; zero is evidence, not a guarantee for image-only pages.
 
-## Cases requiring overrides
+Use `--toc-pages` for unusual navigation-page headings. Use `--page-offset` only for a single known mapping. Prefer automatically inferred piecewise segments or a reviewed manifest for multiple sequences.
 
-Use `--toc-pages` when navigation pages do not say Table of Contents, Contents, Agenda, or Index and do not contain enough consistently aligned rows.
+## Reviewed manifests
 
-Use `--page-offset` when page numbers are absent, stylized as graphics, restart in multiple sections, or use a numbering scheme the detector cannot infer.
+A report's `links` array is replayable with `--link-manifest`. Internal `source_page` and `target_page` values are zero-based. Rectangles use PDF coordinates. Preserve the schema-v2 `input_sha256`; replay refuses a different source. The legacy `source_sha256` field is accepted only for explicitly approved pre-v1.2 manifests used with `--allow-legacy-manifest`.
 
-For documents with multiple independent numbering sequences, process with custom code or split the document into sections. A single global offset cannot represent them reliably.
+For a review repair:
 
-## URL limits
+1. Inspect only flagged TOC pages and pagination boundaries.
+2. Add/correct links and remove false candidates in a copy of the report.
+3. Keep one link per intended visual row.
+4. Set top-level `reviewed` to `true`; unchanged `NEEDS_REVIEW` reports are rejected.
+5. Replay the reviewed file with `--link-manifest`.
+6. Verify the new output using its newly generated report and `verify --link-report`.
 
-The script links visible URL, domain, and email text. It preserves existing URI annotations.
+The reviewed manifest is the reproducible record of manual/OCR decisions. Do not rely on one-off scripts.
 
-It cannot infer a hidden destination from a label such as `Privacy Policy` after a compressor has deleted the original annotation. Supply or restore those destinations manually from a known-good PDF.
+## URLs
 
-URLs split across multiple visual lines may require manual repair. Review the generated JSON report and final annotations.
+Default URL detection links explicit `http://`, `https://`, `www.`, and email text. Bare domains are disabled because OCR frequently produces false strings such as `Brah.ma`. Enable `--allow-bare-domains` only after inspecting candidates.
 
-## Scanned PDFs
+Hidden destinations cannot be inferred from labels such as `Privacy Policy` after an optimizer removes the annotation. Use a known-good same-layout PDF or a reviewed manifest. Split visual URLs can require review.
 
-Scanned/image-only PDFs have no usable word coordinates. Run OCR first, then use this skill. OCR can change text geometry, so render and click verification are mandatory.
+## Scanned PDFs and OCR
 
-Recommended OCR tools:
+An existing OCR text layer may provide usable word coordinates even when no fonts are embedded. Run the normal analyzer first. If it returns `NEEDS_REVIEW`, OCR only the flagged TOC number columns and pagination boundaries when practical; full-document OCR is usually unnecessary and slow.
+
+This skill does not install system OCR software. Use an already approved task-local tool or user-managed installation:
 
 - OCRmyPDF: https://ocrmypdf.readthedocs.io/
-- Tesseract OCR: https://github.com/tesseract-ocr/tesseract
+- Tesseract: https://github.com/tesseract-ocr/tesseract
 
-Typical OCR-first flow:
+If no owned OCR tool is available, inspect the flagged pages and create a reviewed manifest. Never publish the partial automatic candidate.
 
-```powershell
-ocrmypdf --skip-text input.pdf searchable.pdf
-python scripts/run_isolated.py make searchable.pdf
-```
+## Unsupported or review-required cases
 
-If a known-good interactive PDF has the same page count, dimensions, and layout as the compressed or flattened source, prefer `--reference-pdf`. This copies the verified link rectangles and destinations without OCR and is the safest way to restore interactivity lost during optimization.
+- Damaged or malformed PDFs that pypdf/pdfplumber cannot parse.
+- Image-only navigation pages without OCR coordinates.
+- Digital signatures unless invalidation is explicitly authorized.
+- Encrypted input without a password; output is a decrypted copy.
+- XFA, portfolios, embedded-file workflows, or forms whose behavior depends on incremental updates.
+- Reference PDFs with different page count or dimensions.
+- Rotated navigation/URL pages whose extracted coordinates cannot be safely transformed; these return `NEEDS_REVIEW` instead of publishing invalid rectangles.
 
-## Safety
-
-Never overwrite the source. Do not remove existing annotations unless the user explicitly requests replacement. Treat unresolved rows as a verification failure when the user expects every entry to work.
+For same-layout compressed PDFs, `--reference-pdf` remains the safest restoration route. It copies link rectangles and destinations without OCR while preserving the compressed source artwork.

@@ -109,7 +109,7 @@ def main() -> int:
         )
         if provenance["status"] != "PASS" or not provenance["repository_verified"]:
             raise RuntimeError(provenance)
-        if provenance["version"] != "1.1.0" or len(provenance["git_commit"] or "") != 40:
+        if provenance["version"] != "1.2.0" or len(provenance["git_commit"] or "") != 40:
             raise RuntimeError(provenance)
         pinned_provenance = run_json(
             [
@@ -201,7 +201,14 @@ def main() -> int:
         shared_environment = temp_dir / "shared-site-environment"
         venv.EnvBuilder(with_pip=False, system_site_packages=True).create(shared_environment)
         (shared_environment / ".make-interactive-pdfs-environment.json").write_text(
-            json.dumps({"managed_by": "make-interactive-pdfs"}), encoding="utf-8"
+            json.dumps(
+                {
+                    "managed_by": "make-interactive-pdfs",
+                    "environment": str(shared_environment.resolve()),
+                    "skill_root": str(REPO.resolve()),
+                }
+            ),
+            encoding="utf-8",
         )
         run_expect_failure(
             [
@@ -217,6 +224,11 @@ def main() -> int:
             "disable system site packages",
         )
         direct_output = temp_dir / "direct-execution-must-fail.pdf"
+        direct_environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("MAKE_INTERACTIVE_PDFS_")
+        }
         run_expect_failure(
             [
                 sys.executable,
@@ -226,6 +238,7 @@ def main() -> int:
                 str(direct_output),
             ],
             "must run through scripts/run_isolated.py",
+            environment=direct_environment,
         )
         if direct_output.exists():
             raise RuntimeError("Direct execution created an output outside the isolated runner")
@@ -237,6 +250,7 @@ def main() -> int:
                 str(source),
             ],
             "must run through scripts/run_isolated.py",
+            environment=direct_environment,
         )
         run(
             [
@@ -256,6 +270,8 @@ def main() -> int:
                 str(output),
                 "--require-internal",
                 "--require-external",
+                "--link-report",
+                str(report),
                 "--json",
                 str(structural_report),
             ]
@@ -263,12 +279,65 @@ def main() -> int:
         structural_data = json.loads(structural_report.read_text(encoding="utf-8"))
         if structural_data["verification_mode"] != "structural":
             raise RuntimeError(structural_data)
+        if structural_data["schema_version"] != 2:
+            raise RuntimeError(structural_data)
+        if structural_data["link_report_verification"]["status"] != "PASS":
+            raise RuntimeError(structural_data)
         if structural_data["deep_content_check"]:
             raise RuntimeError("Default structural verification repeated the deep content check")
         if structural_data["pixel_compared_pages"] or structural_data["saved_render_dir"]:
             raise RuntimeError("Default structural verification created pixel artifacts")
         if structural_data["pdf_version"] != {"header": "%PDF-1.4", "catalog": "/1.7"}:
             raise RuntimeError(structural_data)
+        if not structural_data.get("visual_resource_check"):
+            raise RuntimeError("Default verification did not check page visual resources")
+        run_expect_failure(
+            [*isolated_command("verify"), str(output), str(output)],
+            "must be different files",
+        )
+        incomplete_report = temp_dir / "incomplete-link-report.json"
+        incomplete_report.write_text(
+            json.dumps({"status": "PASS", "links": []}), encoding="utf-8"
+        )
+        run_expect_failure(
+            [
+                *isolated_command("verify"),
+                str(source),
+                str(output),
+                "--link-report",
+                str(incomplete_report),
+            ],
+            "schema_version must be 2",
+        )
+        json_directory = temp_dir / "verification-json-must-remain-a-directory"
+        json_directory.mkdir()
+        json_sentinel = json_directory / "sentinel.txt"
+        json_sentinel.write_text("preserve me", encoding="utf-8")
+        run_expect_failure(
+            [
+                *isolated_command("verify"),
+                str(source),
+                str(output),
+                "--json",
+                str(json_directory),
+                "--force",
+            ],
+            "regular file path",
+        )
+        if not json_directory.is_dir() or json_sentinel.read_text(encoding="utf-8") != "preserve me":
+            raise RuntimeError("Verification JSON directory guard did not preserve the directory")
+        run_expect_failure(
+            [
+                *isolated_command("verify"),
+                str(source),
+                str(output),
+                "--pixel-compare",
+                "1",
+                "--render-scale",
+                "0",
+            ],
+            "finite number between 0.1 and 10.0",
+        )
         run_expect_failure(
             [
                 *isolated_command("verify"),
@@ -310,6 +379,24 @@ def main() -> int:
         )
         if not (temp_dir / "legacy-verification" / "page-0001.png").is_file():
             raise RuntimeError("Legacy render arguments no longer save requested PNGs")
+        changed_resources = temp_dir / "fixture-changed-resources.pdf"
+        changed_reader = PdfReader(output)
+        changed_writer = PdfWriter(clone_from=changed_reader)
+        changed_writer.pdf_header = changed_reader.pdf_header
+        resources = changed_writer.pages[0]["/Resources"].get_object()
+        fonts = resources["/Font"].get_object()
+        first_font = next(iter(fonts.values())).get_object()
+        first_font[NameObject("/BaseFont")] = NameObject("/Courier")
+        with changed_resources.open("wb") as handle:
+            changed_writer.write(handle)
+        run_expect_failure(
+            [
+                *isolated_command("verify"),
+                str(source),
+                str(changed_resources),
+            ],
+            "visual resources changed",
+        )
         run(
             [
                 *isolated_command("verify"),
@@ -325,7 +412,7 @@ def main() -> int:
             raise RuntimeError(data)
         if data["pdf_version"] != {"header": "%PDF-1.4", "catalog": "/1.7"}:
             raise RuntimeError(data)
-        if data["skill_provenance"]["version"] != "1.1.0":
+        if data["skill_provenance"]["version"] != "1.2.0":
             raise RuntimeError(data["skill_provenance"])
         if not data["skill_provenance"]["bundle_sha256"]:
             raise RuntimeError(data["skill_provenance"])
@@ -388,6 +475,31 @@ def main() -> int:
                 str(broken_output),
             ],
             "invalid internal destination",
+        )
+        wrong_output = temp_dir / "fixture-valid-but-wrong-destination.pdf"
+        wrong_reader = PdfReader(output)
+        wrong_writer = PdfWriter(clone_from=wrong_reader)
+        wrong_writer.pdf_header = wrong_reader.pdf_header
+        changed = False
+        for annotation_ref in wrong_writer.pages[0].get("/Annots", []):
+            annotation = annotation_ref.get_object()
+            if "/Dest" in annotation:
+                annotation["/Dest"][0] = NumberObject(2)
+                changed = True
+                break
+        if not changed:
+            raise RuntimeError("Could not create the semantically wrong destination fixture")
+        with wrong_output.open("wb") as handle:
+            wrong_writer.write(handle)
+        run_expect_failure(
+            [
+                *isolated_command("verify"),
+                str(source),
+                str(wrong_output),
+                "--link-report",
+                str(report),
+            ],
+            "Link-report verification failed",
         )
         run(
             [
