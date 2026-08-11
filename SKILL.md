@@ -16,9 +16,9 @@ Turn a static PDF into a linked copy while preserving its pages, text, dimension
 3. Install Python dependencies from `requirements.txt`.
 4. Run `scripts/make_interactive_pdf.py` using the selected output mode.
 5. Review the printed detection report. Resolve any unmapped or ambiguous TOC rows with the CLI overrides.
-6. Run `scripts/verify_interactive_pdf.py` against the source and result.
-7. Render and visually inspect the cover, every detected navigation page, and representative destinations. Keep verification PNGs in the verifier's temporary directory, never in either user deliverable location, and remove them after inspection.
-8. Open the exact output PDF in Chrome or Acrobat and click at least two internal links and one external link when present.
+6. Run `scripts/verify_interactive_pdf.py` against the source and result. This default structural check requires no browser, image rendering, or repeated text extraction; the linker already checks text parity while creating the PDF.
+7. Only when the user requests stronger visual assurance, install `requirements-pixel.txt` and add `--pixel-compare`; comparison stays in memory and creates no PNGs.
+8. Only when the user explicitly requests live-viewer proof, use browser-harness or manually click representative links in Chrome or Acrobat.
 
 ## Quick Start
 
@@ -31,8 +31,14 @@ python scripts/make_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" --output-mode
 # Choice B: output folder containing the PDF and JSON report
 python scripts/make_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" --output-mode folder
 
-# Verification renders go to a system temporary directory by default
-python scripts/verify_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --render-pages auto
+# Default lightweight structural verification
+python scripts/verify_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal
+
+# Optional in-memory pixel comparison; install requirements-pixel.txt first
+python scripts/verify_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal --pixel-compare auto
+
+# Optional slower repeat of page-by-page extracted-text parity
+python scripts/verify_interactive_pdf.py "D:\PDF\PATH\HERE\test.pdf" "D:\PDF\PATH\HERE\test - Interactive.pdf" --require-internal --deep-content-check
 ```
 
 On macOS or Linux, use the same commands with native paths and `python3` if required.
@@ -51,7 +57,7 @@ The linker automatically:
 - Preserves existing annotations and skips overlapping links to avoid duplicates.
 - Verifies page count, dimensions, text extraction, and final annotation counts before success.
 
-Read [references/heuristics-and-limitations.md](references/heuristics-and-limitations.md) when auto-detection reports ambiguity, scans contain no selectable text, or link labels hide their actual URLs. Read [references/dependencies.md](references/dependencies.md) for dependency links and browser verification setup.
+Read [references/heuristics-and-limitations.md](references/heuristics-and-limitations.md) when auto-detection reports ambiguity, scans contain no selectable text, or link labels hide their actual URLs. Read [references/dependencies.md](references/dependencies.md) for core and optional verification dependencies.
 
 ## Useful Overrides
 
@@ -83,12 +89,15 @@ Do not declare completion unless:
 
 - The output has the same page count and page dimensions as the source.
 - Extracted text matches page by page.
+- Every internal destination resolves to a valid physical PDF page.
+- Every link rectangle has positive area and remains within its source page.
+- Every external link has a valid supported URI.
 - All intended TOC rows have destinations or are explicitly reported as unresolved.
 - Visible URLs are linked or explicitly reported as unsupported.
-- Render comparison shows no artwork changes.
-- Click testing reaches the expected physical PDF pages.
 - The final output path, link counts, unresolved rows, and verification results are reported to the user.
 - The user-facing deliverable contains only the artifacts promised by the selected output choice.
+
+If optional pixel comparison is requested, require an exact in-memory artwork match. If optional live-viewer verification is requested, require the tested clicks to reach their expected pages or URLs. Do not install browser-harness or create verification PNGs during the default workflow.
 
 If compression is also required, compress the static artwork first and add link annotations last. Some PDF optimizers discard annotations.
 

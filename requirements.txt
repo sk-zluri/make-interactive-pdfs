@@ -1,3 +1,2 @@
 pypdf>=6.0,<7
 pdfplumber>=0.11,<1
-PyMuPDF>=1.26,<2

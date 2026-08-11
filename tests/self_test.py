@@ -10,7 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NumberObject
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
@@ -49,6 +50,13 @@ def run(command: list[str]) -> None:
     print(completed.stdout)
 
 
+def run_expect_failure(command: list[str], expected_text: str) -> None:
+    completed = subprocess.run(command, text=True, capture_output=True)
+    combined = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode == 0 or expected_text not in combined:
+        raise RuntimeError(f"Command did not fail as expected: {' '.join(command)}\n{combined}")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="interactive-pdf-self-test-") as temp:
         temp_dir = Path(temp)
@@ -56,6 +64,8 @@ def main() -> int:
         output = temp_dir / "fixture-interactive.pdf"
         restored = temp_dir / "fixture-restored-from-reference.pdf"
         report = temp_dir / "report.json"
+        structural_report = temp_dir / "structural-verification.json"
+        pixel_report = temp_dir / "pixel-verification.json"
         create_fixture(source)
         run(
             [
@@ -77,10 +87,57 @@ def main() -> int:
                 str(output),
                 "--require-internal",
                 "--require-external",
+                "--json",
+                str(structural_report),
+            ]
+        )
+        structural_data = json.loads(structural_report.read_text(encoding="utf-8"))
+        if structural_data["verification_mode"] != "structural":
+            raise RuntimeError(structural_data)
+        if structural_data["deep_content_check"]:
+            raise RuntimeError("Default structural verification repeated the deep content check")
+        if structural_data["pixel_compared_pages"] or structural_data["saved_render_dir"]:
+            raise RuntimeError("Default structural verification created pixel artifacts")
+        run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "verify_interactive_pdf.py"),
+                str(source),
+                str(output),
+                "--require-internal",
+                "--require-external",
+                "--pixel-compare",
+                "1,4",
+                "--json",
+                str(pixel_report),
+            ]
+        )
+        pixel_data = json.loads(pixel_report.read_text(encoding="utf-8"))
+        if pixel_data["verification_mode"] != "structural+pixel":
+            raise RuntimeError(pixel_data)
+        if pixel_data["pixel_compared_pages"] != [1, 4] or pixel_data["saved_render_dir"]:
+            raise RuntimeError("In-memory pixel verification produced unexpected artifacts")
+        run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "verify_interactive_pdf.py"),
+                str(source),
+                str(output),
                 "--render-pages",
-                "auto",
+                "1",
                 "--render-dir",
-                str(temp_dir / "verification"),
+                str(temp_dir / "legacy-verification"),
+            ]
+        )
+        if not (temp_dir / "legacy-verification" / "page-0001.png").is_file():
+            raise RuntimeError("Legacy render arguments no longer save requested PNGs")
+        run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "verify_interactive_pdf.py"),
+                str(source),
+                str(output),
+                "--deep-content-check",
             ]
         )
         data = json.loads(report.read_text(encoding="utf-8"))
@@ -90,6 +147,29 @@ def main() -> int:
             raise RuntimeError(data)
         if len(PdfReader(output).pages) != 4:
             raise RuntimeError("Output page count mismatch")
+        broken_output = temp_dir / "fixture-broken-destination.pdf"
+        broken_reader = PdfReader(output)
+        broken_writer = PdfWriter(clone_from=broken_reader)
+        changed = False
+        for annotation_ref in broken_writer.pages[0].get("/Annots", []):
+            annotation = annotation_ref.get_object()
+            if "/Dest" in annotation:
+                annotation["/Dest"][0] = NumberObject(999)
+                changed = True
+                break
+        if not changed:
+            raise RuntimeError("Could not create the invalid-destination fixture")
+        with broken_output.open("wb") as handle:
+            broken_writer.write(handle)
+        run_expect_failure(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "verify_interactive_pdf.py"),
+                str(source),
+                str(broken_output),
+            ],
+            "invalid internal destination",
+        )
         run(
             [
                 sys.executable,
