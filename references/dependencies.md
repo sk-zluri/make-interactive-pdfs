@@ -10,6 +10,8 @@ Core libraries:
 - pdfplumber: https://github.com/jsvine/pdfplumber
 - pdfminer.six: https://pdfminersix.readthedocs.io/
 - pypdfium2: https://pypdfium2.readthedocs.io/
+- RapidOCR: https://github.com/RapidAI/RapidOCR
+- ONNX Runtime: https://onnxruntime.ai/
 
 If the checkout is read-only, put `--venv-dir PATH` before `make` or `verify`. A reusable environment must carry the matching skill ownership marker, checkout path, and disabled-system-site configuration.
 
@@ -40,4 +42,4 @@ Browser automation is unnecessary for generation and normal verification. Use a 
 
 - Browser Harness: https://github.com/browser-use/browser-harness
 
-OCR is not a normal dependency and must never be installed system-wide by the skill. See [heuristics-and-limitations.md](heuristics-and-limitations.md) for the targeted review workflow.
+OCR dependencies are exact-pinned inside the checkout-owned environment and bundled into the Windows app. They are never installed system-wide and do not download models at run time. See [heuristics-and-limitations.md](heuristics-and-limitations.md) for the fail-closed OCR workflow.

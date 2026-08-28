@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from pypdf import PdfReader, PdfWriter
@@ -146,6 +146,77 @@ def make_url_fixture(path: Path) -> None:
     pdf.save()
 
 
+def make_image_only_toc_fixture(path: Path, image_path: Path) -> None:
+    image = Image.new("RGB", (1200, 1697), "white")
+    drawing = ImageDraw.Draw(image)
+    heading_font = ImageFont.load_default(size=68)
+    row_font = ImageFont.load_default(size=48)
+    drawing.text((90, 90), "CONTENTS", fill="black", font=heading_font)
+    drawing.text((90, 210), "Chapter One", fill="black", font=row_font)
+    drawing.text((1040, 210), "01", fill="black", font=row_font)
+    drawing.text((90, 290), "Chapter Two", fill="black", font=row_font)
+    drawing.text((1040, 290), "02", fill="black", font=row_font)
+    drawing.text(
+        (90, 370),
+        "Document navigation and chapter guide",
+        fill="black",
+        font=row_font,
+    )
+    image.save(image_path, format="PNG")
+
+    pdf = canvas.Canvas(str(path), pagesize=A4, pdfVersion=(1, 6))
+    for _ in range(2):
+        pdf.drawImage(str(image_path), 0, 0, width=WIDTH, height=HEIGHT)
+        pdf.showPage()
+    draw_body(pdf, "Chapter One", "1")
+    draw_body(pdf, "Chapter Two", "2")
+    draw_body(pdf, "Appendix", "3")
+    draw_body(pdf, "Notes", "4")
+    pdf.save()
+
+
+def make_image_toc_with_text_layer_fixture(path: Path, image_path: Path) -> None:
+    image = Image.new("RGB", (1200, 1697), "white")
+    drawing = ImageDraw.Draw(image)
+    heading_font = ImageFont.load_default(size=68)
+    row_font = ImageFont.load_default(size=48)
+    drawing.text((90, 90), "CONTENTS", fill="black", font=heading_font)
+    drawing.text((90, 210), "Chapter One", fill="black", font=row_font)
+    drawing.text((1040, 210), "01", fill="black", font=row_font)
+    drawing.text((90, 290), "Chapter Two", fill="black", font=row_font)
+    drawing.text((1040, 290), "02", fill="black", font=row_font)
+    drawing.text(
+        (90, 370),
+        "Document navigation and chapter guide",
+        fill="black",
+        font=row_font,
+    )
+    image.save(image_path, format="PNG")
+
+    pdf = canvas.Canvas(str(path), pagesize=A4, pdfVersion=(1, 6))
+    for _ in range(2):
+        pdf.drawImage(str(image_path), 0, 0, width=WIDTH, height=HEIGHT)
+        for x, y, value, size in (
+            (54, HEIGHT - 70, "CONTENTS", 22),
+            (54, HEIGHT - 125, "Chapter One", 12),
+            (WIDTH - 72, HEIGHT - 125, "01", 12),
+            (54, HEIGHT - 165, "Chapter Two", 12),
+            (WIDTH - 72, HEIGHT - 165, "02", 12),
+            (54, HEIGHT - 205, "Document navigation and chapter guide", 12),
+        ):
+            text = pdf.beginText(x, y)
+            text.setFont("Helvetica", size)
+            text.setTextRenderMode(3)
+            text.textLine(value)
+            pdf.drawText(text)
+        pdf.showPage()
+    draw_body(pdf, "Chapter One", "1")
+    draw_body(pdf, "Chapter Two", "2")
+    draw_body(pdf, "Appendix", "3")
+    draw_body(pdf, "Notes", "4")
+    pdf.save()
+
+
 def make_jpeg_link_fixture(path: Path, jpeg_path: Path) -> None:
     Image.new("RGB", (24, 24), (220, 24, 32)).save(jpeg_path, format="JPEG")
     pdf = canvas.Canvas(str(path), pagesize=A4, pdfVersion=(1, 6))
@@ -239,13 +310,18 @@ def add_existing_links(
         writer.write(handle)
 
 
-def rotate_first_page(source: Path, output: Path) -> None:
+def rotate_pages(source: Path, output: Path, page_indices: tuple[int, ...]) -> None:
     reader = PdfReader(source)
     writer = PdfWriter(clone_from=reader)
     writer.pdf_header = reader.pdf_header
-    writer.pages[0].rotate(90)
+    for page_index in page_indices:
+        writer.pages[page_index].rotate(90)
     with output.open("wb") as handle:
         writer.write(handle)
+
+
+def rotate_first_page(source: Path, output: Path) -> None:
+    rotate_pages(source, output, (0,))
 
 
 def add_malformed_links(source: Path, output: Path) -> None:
@@ -424,6 +500,59 @@ def test_multiple_and_piecewise(temp: Path) -> None:
 
 
 def test_fail_closed_and_urls(temp: Path) -> None:
+    image_toc_raw = temp / "image-toc-unrotated.pdf"
+    image_toc = temp / "image-toc.pdf"
+    image_toc_png = temp / "image-toc.png"
+    image_toc_output = temp / "image-toc-interactive.pdf"
+    image_toc_report = temp / "image-toc-report.json"
+    make_image_only_toc_fixture(image_toc_raw, image_toc_png)
+    rotate_pages(image_toc_raw, image_toc, (0, 1))
+    image_toc_data = run_json(
+        command(
+            "make",
+            image_toc,
+            "--output",
+            image_toc_output,
+            "--report-json",
+            image_toc_report,
+        ),
+        expected_code=0,
+    )
+    if image_toc_data["status"] != "PASS":
+        raise RuntimeError(image_toc_data)
+    if not image_toc_data.get("ocr", {}).get("used"):
+        raise RuntimeError(image_toc_data)
+    if image_toc_data.get("ocr", {}).get("enriched_pages") != [1, 2]:
+        raise RuntimeError(image_toc_data)
+    if not image_toc_output.is_file() or not image_toc_report.is_file():
+        raise RuntimeError("Image-only TOC OCR did not publish a verified PDF")
+    if image_toc_data.get("final_links", {}).get("internal", 0) < 2:
+        raise RuntimeError(image_toc_data)
+
+    overlay_toc = temp / "image-toc-with-text-layer.pdf"
+    overlay_toc_png = temp / "image-toc-with-text-layer.png"
+    overlay_toc_output = temp / "image-toc-with-text-layer-interactive.pdf"
+    overlay_toc_report = temp / "image-toc-with-text-layer-report.json"
+    make_image_toc_with_text_layer_fixture(overlay_toc, overlay_toc_png)
+    overlay_toc_data = run_json(
+        command(
+            "make",
+            overlay_toc,
+            "--output",
+            overlay_toc_output,
+            "--report-json",
+            overlay_toc_report,
+        )
+    )
+    if overlay_toc_data["status"] != "PASS":
+        raise RuntimeError(overlay_toc_data)
+    if overlay_toc_data.get("ocr", {}).get("used"):
+        raise RuntimeError(
+            f"Healthy selectable scan overlay was unnecessarily OCRed: {overlay_toc_data}"
+        )
+    if overlay_toc_data.get("final_links", {}).get("internal", 0) < 2:
+        raise RuntimeError(overlay_toc_data)
+
     corrupt = temp / "corrupt.pdf"
     corrupt_output = temp / "corrupt-interactive.pdf"
     corrupt_report = temp / "corrupt-report.json"
@@ -747,14 +876,14 @@ def test_form_rotation_and_destination_safety(temp: Path) -> None:
             rotated_report,
             "--no-toc-links",
         ),
-        expected_code=2,
     )
     if (
-        rotated["status"] != "NEEDS_REVIEW"
-        or rotated["rotated_automatic_url_pages"] != [1]
-        or rotated_output.exists()
+        rotated["status"] != "PASS"
+        or rotated["rotated_automatic_url_pages"]
+        or rotated["added_links"].get("external") != 3
+        or not rotated_output.exists()
     ):
-        raise RuntimeError("Rotated automatic URL geometry did not fail closed")
+        raise RuntimeError("Rotated automatic URL geometry was not transformed safely")
 
     output_directory = temp / "forced-output-directory"
     output_directory.mkdir()
@@ -881,7 +1010,162 @@ def test_link_validity_resources_and_concurrency(temp: Path) -> None:
         raise RuntimeError(f"Concurrent publication left transaction artifacts: {leftovers}")
 
 
+def test_ocr_selection_rules() -> None:
+    scripts_path = str(REPO / "scripts")
+    if scripts_path not in sys.path:
+        sys.path.insert(0, scripts_path)
+    import numpy as np
+
+    from local_ocr import (
+        OCRDecision,
+        OCRSummary,
+        _looks_visually_blank,
+        _ocr_is_safe_replacement,
+        choose_page_words,
+        ocr_decision,
+    )
+
+    def words(*tokens: str) -> list[dict]:
+        return [{"text": token} for token in tokens]
+
+    healthy_tokens = tuple(f"security{index}" for index in range(10))
+    healthy = ocr_decision(
+        words(*healthy_tokens),
+        " ".join(healthy_tokens),
+        1.0,
+        has_nontext_content=True,
+    )
+    if healthy.should_ocr or healthy.reason != "native_text_usable":
+        raise RuntimeError(f"Healthy scan-backed text triggered OCR: {healthy}")
+
+    unicode_tokens = ("सुरक्षा", "विश्वास", "गोपनीयता", "जानकारी") * 3
+    unicode_text = " ".join(unicode_tokens)
+    unicode_decision = ocr_decision(
+        words(*unicode_tokens),
+        unicode_text,
+        1.0,
+        has_nontext_content=True,
+    )
+    if unicode_decision.should_ocr:
+        raise RuntimeError(f"Healthy Unicode text triggered OCR: {unicode_decision}")
+
+    expected = (
+        (ocr_decision([], "", 1.0, has_nontext_content=True), True, "no_text"),
+        (ocr_decision([], "", 0.0, has_nontext_content=True), True, "no_text"),
+        (ocr_decision([], "", 0.0, has_nontext_content=False), False, "blank_page"),
+        (
+            ocr_decision(
+                words("Annual", "Report", "2026"),
+                "Annual Report 2026",
+                0.0,
+                has_nontext_content=False,
+            ),
+            False,
+            "sparse_native_text",
+        ),
+        (
+            ocr_decision(
+                words("Annual", "Report", "2026"),
+                "Annual Report 2026",
+                1.0,
+                has_nontext_content=True,
+            ),
+            True,
+            "sparse_scan",
+        ),
+        (
+            ocr_decision(
+                words("\ufffd", "\ufffd", "\ufffd", "security"),
+                "\ufffd \ufffd \ufffd security",
+                0.0,
+                has_nontext_content=False,
+            ),
+            True,
+            "garbled_text",
+        ),
+        (
+            ocr_decision(
+                words("Chapter", "(cid:42)", "Guide", "(cid:91)"),
+                "Chapter (cid:42) Guide (cid:91)",
+                0.0,
+                has_nontext_content=False,
+            ),
+            True,
+            "garbled_text",
+        ),
+        (
+            ocr_decision(
+                words("<broken>", "~~text~~", "{missing}", "value"),
+                "<broken> ~~text~~ {missing} value",
+                0.0,
+                has_nontext_content=False,
+            ),
+            True,
+            "garbled_text",
+        ),
+    )
+    for decision, should_ocr, reason in expected:
+        if decision.should_ocr != should_ocr or decision.reason != reason:
+            raise RuntimeError(
+                f"Unexpected OCR decision {decision}; expected {should_ocr=} {reason=}"
+            )
+
+    garbled_native = words("<broken>", "~~text~~", "{missing}", "value")
+    if _ocr_is_safe_replacement(garbled_native, words("one"), "garbled_text"):
+        raise RuntimeError("A one-word OCR result replaced a longer garbled text layer")
+    healthy_ocr = words("Correct", "readable", "replacement", "text", "for", "page")
+    if not _ocr_is_safe_replacement(
+        garbled_native,
+        healthy_ocr,
+        "garbled_text",
+    ):
+        raise RuntimeError("A healthy OCR result was rejected for garbled native text")
+
+    selected, outcome = choose_page_words(
+        garbled_native,
+        [],
+        OCRDecision(True, "garbled_text", replace_native=True),
+    )
+    if outcome != "quality_unresolved" or selected != garbled_native:
+        raise RuntimeError("Unresolved garbled text was not retained and flagged")
+    selected, outcome = choose_page_words(
+        garbled_native,
+        healthy_ocr,
+        OCRDecision(True, "garbled_text", replace_native=True),
+    )
+    if outcome != "replaced" or selected != healthy_ocr:
+        raise RuntimeError("Clearly better OCR did not replace garbled native text")
+
+    blank_scan = np.full((100, 80), 252, dtype=np.uint8)
+    if not _looks_visually_blank(blank_scan):
+        raise RuntimeError("A uniform white scanned page was not recognized as blank")
+    blank_scan[45:55, 20:60] = 30
+    if _looks_visually_blank(blank_scan):
+        raise RuntimeError("A scanned page containing visible ink was treated as blank")
+
+    report = OCRSummary(
+        engine="test",
+        version="1",
+        model_sha256="hash",
+        attempted_pages=(2, 4),
+        enriched_pages=(2,),
+        failed_pages=(),
+        attempt_reasons=(("no_text", (2, 4)),),
+        skipped_blank_pages=(5,),
+        native_text_pages=2,
+        replaced_pages=(2,),
+        no_text_found_pages=(4,),
+    ).as_report()
+    if report["attempt_reasons"] != {"no_text": [2, 4]}:
+        raise RuntimeError(report)
+    if report["skipped_blank_pages"] != [5] or report["native_text_pages"] != 2:
+        raise RuntimeError(report)
+    if report["replaced_pages"] != [2] or report["no_text_found_pages"] != [4]:
+        raise RuntimeError(report)
+
+
 def main() -> int:
+    test_ocr_selection_rules()
     with tempfile.TemporaryDirectory(prefix="interactive-pdf-regression-") as raw_temp:
         temp = Path(raw_temp)
         test_mixed_and_manifest(temp)

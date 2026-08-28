@@ -176,7 +176,7 @@ def isolated_environment() -> dict[str, str]:
 
 
 def dependencies_importable(python: Path, profile: str) -> bool:
-    modules = ["pypdf", "pdfplumber"]
+    modules = ["pypdf", "pdfplumber", "rapidocr", "onnxruntime"]
     if profile in {"pixel", "dev"}:
         modules.append("pymupdf")
     if profile == "dev":

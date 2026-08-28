@@ -2,6 +2,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.build-venv/
+.serena/
 venv/
 *.link-report.json
 *-verification/
+tmp/
+build/
+dist/
+release/
+Test PDFs/
+Test Runs/
+Icon/Make Interactive PDFs (new).png

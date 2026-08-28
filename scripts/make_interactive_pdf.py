@@ -33,6 +33,8 @@ from pypdf.generic import (
     StreamObject,
 )
 
+from local_ocr import OCRSummary, ocr_low_text_pages
+from progress_events import emit_progress
 from skill_provenance import require_isolated_runtime
 
 
@@ -110,9 +112,14 @@ class PageAnalysis:
     page_index: int
     width: float
     height: float
+    rotation: int
+    image_area_ratio: float
     words: list[dict]
     lines: list[list[dict]]
+    raw_text: str
     normalized_text: str
+    nontext_object_count: int
+    content_stream_bytes: int
     margin_labels: list[PageLabelObservation]
     ordinal_anchor_count: int
 
@@ -121,6 +128,28 @@ def normalize_text(value: str) -> str:
     value = value.casefold().replace("&", " and ")
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return " ".join(value.split())
+
+
+def visual_rect_to_pdf(
+    x0: float,
+    top: float,
+    x1: float,
+    bottom: float,
+    *,
+    width: float,
+    height: float,
+    rotation: int = 0,
+) -> tuple[float, float, float, float]:
+    """Convert a displayed top-origin rectangle to the page's PDF user space."""
+
+    rotation = int(rotation) % 360
+    if rotation == 90:
+        return (top, x0, bottom, x1)
+    if rotation == 180:
+        return (width - x1, top, width - x0, bottom)
+    if rotation == 270:
+        return (height - bottom, width - x1, height - top, width - x0)
+    return (x0, height - bottom, x1, height - top)
 
 
 def roman_to_int(value: str) -> int | None:
@@ -220,7 +249,15 @@ def toc_rows_for_page(page_index: int, page, words: Sequence[dict] | None = None
         x1 = min(float(page.width), max(float(word["x1"]) for word in line) + 1.5)
         top = max(0.0, min(float(word["top"]) for word in line) - 1.5)
         bottom = min(float(page.height), max(float(word["bottom"]) for word in line) + 1.5)
-        rect = (x0, float(page.height) - bottom, x1, float(page.height) - top)
+        rect = visual_rect_to_pdf(
+            x0,
+            top,
+            x1,
+            bottom,
+            width=float(page.width),
+            height=float(page.height),
+            rotation=int(getattr(page, "rotation", 0)),
+        )
         rows.append(TocRow(page_index, title, str(line[-1]["text"]), label, label_kind, rect))
     return rows
 
@@ -269,28 +306,108 @@ def ordinal_anchor_count(width: float, height: float, words: Sequence[dict]) -> 
 def analyze_document(plumber_pdf) -> list[PageAnalysis]:
     page_count = len(plumber_pdf.pages)
     analyses: list[PageAnalysis] = []
+    emit_progress(
+        "READING_PAGES",
+        completed=0,
+        total=page_count,
+        unit="page",
+        page=1,
+        total_pages=page_count,
+        message="Reading the PDF text layer",
+    )
     for page_index, page in enumerate(plumber_pdf.pages):
-        if page_index and page_index % 100 == 0:
-            print(f"Analyzed {page_index}/{page_count} pages...", file=sys.stderr)
         words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
         lines = group_words_into_lines(words)
         ordered_text = " ".join(str(word["text"]) for line in lines for word in line)
         width, height = float(page.width), float(page.height)
+        image_area = 0.0
+        for image in page.images:
+            image_width = max(0.0, float(image.get("x1", 0.0)) - float(image.get("x0", 0.0)))
+            image_height = max(
+                0.0,
+                float(image.get("bottom", 0.0)) - float(image.get("top", 0.0)),
+            )
+            image_area += image_width * image_height
+        page_area = width * height
+        image_area_ratio = min(1.0, image_area / page_area) if page_area > 0 else 0.0
+        nontext_object_count = sum(
+            len(page.objects.get(kind, ()))
+            for kind in ("image", "rect", "curve", "line")
+        )
+        content_stream_bytes = 0
+        for stream in getattr(page.page_obj, "contents", ()) or ():
+            try:
+                content_stream_bytes += len(stream.get_data())
+            except (AttributeError, OSError, TypeError, ValueError):
+                continue
         analyses.append(
             PageAnalysis(
                 page_index=page_index,
                 width=width,
                 height=height,
+                rotation=int(getattr(page, "rotation", 0) or 0) % 360,
+                image_area_ratio=image_area_ratio,
                 words=words,
                 lines=lines,
+                raw_text=ordered_text,
                 normalized_text=normalize_text(ordered_text),
+                nontext_object_count=nontext_object_count,
+                content_stream_bytes=content_stream_bytes,
                 margin_labels=margin_label_observations(
                     page_index, width, height, words, page_count
                 ),
                 ordinal_anchor_count=ordinal_anchor_count(width, height, words),
             )
         )
+        emit_progress(
+            "READING_PAGES",
+            completed=page_index + 1,
+            total=page_count,
+            unit="page",
+            page=page_index + 1,
+            total_pages=page_count,
+            message=f"Read page {page_index + 1} of {page_count}",
+        )
+        # pdfplumber otherwise retains each page's full parsed layout until the
+        # document closes. The compact PageAnalysis above is all later phases need.
+        close_page = getattr(page, "close", None)
+        if callable(close_page):
+            close_page()
     return analyses
+
+
+def replace_analysis_words(
+    analysis: PageAnalysis, words: Sequence[dict], page_count: int
+) -> None:
+    """Rebuild one analysis with OCR words while keeping the normal heuristics."""
+
+    rotation_normalized = any(
+        bool(word.get("_ocr_rotation_normalized")) for word in words
+    )
+    rebuilt_words = [
+        {key: value for key, value in word.items() if key != "_ocr_rotation_normalized"}
+        for word in words
+    ]
+    if rotation_normalized:
+        if analysis.rotation in (90, 270):
+            analysis.width, analysis.height = analysis.height, analysis.width
+        analysis.rotation = 0
+    lines = group_words_into_lines(rebuilt_words)
+    ordered_text = " ".join(str(word["text"]) for line in lines for word in line)
+    analysis.words = rebuilt_words
+    analysis.lines = lines
+    analysis.raw_text = ordered_text
+    analysis.normalized_text = normalize_text(ordered_text)
+    analysis.margin_labels = margin_label_observations(
+        analysis.page_index,
+        analysis.width,
+        analysis.height,
+        rebuilt_words,
+        page_count,
+    )
+    analysis.ordinal_anchor_count = ordinal_anchor_count(
+        analysis.width, analysis.height, rebuilt_words
+    )
 
 
 def detect_toc_pages(
@@ -303,6 +420,7 @@ def detect_toc_pages(
         class PageShape:
             width = analysis.width
             height = analysis.height
+            rotation = analysis.rotation
 
         rows = toc_rows_for_page(page_index, PageShape(), analysis.words)
         rows_by_page[page_index] = rows
@@ -725,11 +843,14 @@ def visible_url_candidates(
             uri = normalized_uri(raw, allow_bare_domains=allow_bare_domains)
             if uri is None:
                 continue
-            rect = (
+            rect = visual_rect_to_pdf(
                 float(word["x0"]),
-                analysis.height - float(word["bottom"]),
+                float(word["top"]),
                 float(word["x1"]),
-                analysis.height - float(word["top"]),
+                float(word["bottom"]),
+                width=analysis.width,
+                height=analysis.height,
+                rotation=analysis.rotation,
             )
             yield AddedLink("external", analysis.page_index, rect, uri=uri, label=raw)
 
@@ -1477,6 +1598,14 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             + ", ".join(unsupported_features)
         )
     page_count = len(reader.pages)
+    emit_progress(
+        "PREFLIGHT",
+        completed=1,
+        total=1,
+        unit="check",
+        total_pages=page_count,
+        message=f"Opened {page_count}-page PDF safely",
+    )
     source_link_errors = link_annotation_errors(reader)
     if source_link_errors:
         preview = "; ".join(source_link_errors[:10])
@@ -1499,8 +1628,10 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     pagination_diagnostics: list[dict] = []
     completeness_diagnostics: list[dict] = []
     suspected_unparsed_rows = 0
+    nontext_visual_pages: list[int] = []
     parsed_toc_rows = 0
     covered_existing_rows = 0
+    ocr_summary: OCRSummary | None = None
     covered_replay_links: list[AddedLink] = []
     replay_conflicts: list[dict] = []
     rotated_automatic_url_pages: set[int] = set()
@@ -1573,20 +1704,58 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     else:
         with pdfplumber.open(input_path, password=args.password) as plumber_pdf:
             analyses = analyze_document(plumber_pdf)
+            rotations = [
+                int(page.get("/Rotate", 0) or 0) % 360 for page in reader.pages
+            ]
+            ocr_replacements, ocr_summary = ocr_low_text_pages(
+                input_path,
+                analyses,
+                password=args.password,
+                rotations=rotations,
+                on_selection=lambda selected, total: emit_progress(
+                    "OCR_PAGES",
+                    completed=0,
+                    total=selected,
+                    unit="page",
+                    total_pages=page_count,
+                    message=(
+                        f"Existing text is ready on {total - selected} of {total} pages; "
+                        f"local OCR is needed on {selected} "
+                        f"page{'s' if selected != 1 else ''}"
+                    ),
+                    counts={
+                        "native_or_blank_pages": total - selected,
+                        "ocr_pages": selected,
+                    },
+                ),
+                on_page_started=lambda completed, total, page_index: emit_progress(
+                    "OCR_PAGES",
+                    completed=min(total, completed + 1),
+                    total=total,
+                    unit="page",
+                    page=page_index + 1,
+                    total_pages=page_count,
+                    message=f"Scanning page {page_index + 1} with local OCR",
+                ),
+                on_page_finished=lambda completed, total, page_index, words: emit_progress(
+                    "OCR_PAGES",
+                    completed=completed,
+                    total=total,
+                    unit="page",
+                    page=page_index + 1,
+                    total_pages=page_count,
+                    message=(
+                        f"Finished OCR on page {page_index + 1}"
+                        if words
+                        else f"No readable text found on page {page_index + 1}"
+                    ),
+                    counts={"words_found": words},
+                ),
+            )
+            for page_index, ocr_words in ocr_replacements.items():
+                replace_analysis_words(analyses[page_index], ocr_words, page_count)
             explicit_toc_pages = parse_page_list(args.toc_pages, page_count)
             toc_pages, rows_by_page = detect_toc_pages(analyses, explicit_toc_pages)
-            geometry_review_pages = [
-                page_index + 1
-                for page_index in sorted(toc_pages)
-                if int(reader.pages[page_index].get("/Rotate", 0) or 0) % 360 != 0
-            ]
-            if geometry_review_pages:
-                message = (
-                    "Rotated navigation pages require reviewed annotation coordinates: "
-                    + ", ".join(str(page) for page in geometry_review_pages)
-                )
-                warnings.append(message)
-                review_reasons.append(message)
             pagination_segments, pagination_diagnostics = infer_pagination_segments(
                 analyses, toc_pages
             )
@@ -1622,6 +1791,30 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 (segment.evidence_pages for segment in pagination_segments), default=0
             )
             normalized_pages = [analysis.normalized_text for analysis in analyses]
+            if not toc_pages and not args.no_toc_links:
+                # A contents page converted to outlines or a page-sized image has no
+                # readable words. Inspect only likely front matter so ordinary image
+                # pages later in a document do not make the whole job ambiguous.
+                for page_index in range(min(page_count, 12)):
+                    if normalized_pages[page_index].strip():
+                        continue
+                    page = reader.pages[page_index]
+                    contents = page.get_contents()
+                    try:
+                        content_bytes = len(contents.get_data()) if contents is not None else 0
+                    except (AttributeError, OSError, TypeError, ValueError):
+                        content_bytes = 0
+                    resources = page.get("/Resources") or {}
+                    try:
+                        xobjects = resources.get("/XObject")
+                        if hasattr(xobjects, "get_object"):
+                            xobjects = xobjects.get_object()
+                        has_xobjects = bool(xobjects)
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        has_xobjects = False
+                    if content_bytes >= 4096 or has_xobjects:
+                        nontext_visual_pages.append(page_index)
+
             parsed_toc_rows = sum(len(rows_by_page[page]) for page in toc_pages)
             completeness_diagnostics, suspected_unparsed_rows = toc_completeness_diagnostics(
                 analyses, toc_pages, rows_by_page
@@ -1642,8 +1835,22 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 review_reasons.append(message)
 
             if not args.no_toc_links:
+                planned_row_number = 0
                 for source_page in sorted(toc_pages):
                     for row in rows_by_page[source_page]:
+                        planned_row_number += 1
+                        emit_progress(
+                            "PLANNING_LINKS",
+                            completed=planned_row_number - 1,
+                            total=parsed_toc_rows,
+                            unit="link",
+                            page=source_page + 1,
+                            total_pages=page_count,
+                            message=(
+                                f"Matching contents entry {planned_row_number} "
+                                f"of {parsed_toc_rows}"
+                            ),
+                        )
                         block_index = block_index_for_page(source_page, blocks)
                         if block_index is None:
                             destination, matched_by, confidence, evidence = (
@@ -1707,6 +1914,16 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                         added.append(link)
                         occupied[source_page].append(row.rect)
 
+                emit_progress(
+                    "PLANNING_LINKS",
+                    completed=parsed_toc_rows,
+                    total=parsed_toc_rows,
+                    unit="link",
+                    total_pages=page_count,
+                    message=f"Matched {len(added)} safe links",
+                    counts={"links_planned": len(added)},
+                )
+
             if not args.no_url_links:
                 for analysis in analyses:
                     for word in analysis.words:
@@ -1716,9 +1933,6 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 for link in visible_url_candidates(
                     analyses, allow_bare_domains=args.allow_bare_domains
                 ):
-                    if int(reader.pages[link.source_page].get("/Rotate", 0) or 0) % 360 != 0:
-                        rotated_automatic_url_pages.add(link.source_page)
-                        continue
                     if any(rect_overlap_ratio(link.rect, rect) >= 0.8 for rect in occupied[link.source_page]):
                         continue
                     added.append(link)
@@ -1733,6 +1947,12 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 continue
             added.append(link)
             occupied[link.source_page].append(link.rect)
+
+    if ocr_summary is not None and ocr_summary.failed_pages:
+        pages = ", ".join(str(page) for page in ocr_summary.failed_pages)
+        message = f"Local OCR could not complete on page(s): {pages}."
+        warnings.append(message)
+        review_reasons.append(message)
 
     invalid_external_links = [
         link for link in added if link.kind == "external" and not supported_uri(str(link.uri))
@@ -1758,6 +1978,28 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         review_reasons.append(message)
     if not toc_pages and not args.no_toc_links and not reference_path and not manifest_path:
         warnings.append("No TOC-like pages were detected. Use --toc-pages for unusual layouts.")
+        if len(nontext_visual_pages) >= 2 and not existing_counts["internal"]:
+            pages = ", ".join(str(page + 1) for page in nontext_visual_pages)
+            message = (
+                "Visually populated front-matter pages have no extractable text "
+                f"({pages}). Their navigation cannot be checked safely; use OCR or a "
+                "reviewed link manifest."
+            )
+            warnings.append(message)
+            review_reasons.append(message)
+    if (
+        toc_pages
+        and not parsed_toc_rows
+        and not args.no_toc_links
+        and not reference_path
+        and not manifest_path
+    ):
+        message = (
+            "The selected navigation pages contain no readable TOC rows. Use OCR or a "
+            "reviewed link manifest."
+        )
+        warnings.append(message)
+        review_reasons.append(message)
     if unresolved:
         message = f"{len(unresolved)} detected TOC rows could not be safely mapped."
         warnings.append(message)
@@ -1792,6 +2034,14 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         "output_sha256": None,
         "output_mode": output_mode,
         "mode": mode,
+        "ocr": (
+            {
+                "used": bool(ocr_summary.attempted_pages),
+                **ocr_summary.as_report(),
+            }
+            if ocr_summary is not None
+            else {"used": False}
+        ),
         "skill_provenance": runtime_provenance,
         "pdf_version": source_pdf_version,
         "pages": page_count,
@@ -1807,6 +2057,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             page + 1 for page in sorted(rotated_automatic_url_pages)
         ],
         "suspected_unparsed_toc_rows": suspected_unparsed_rows,
+        "nontext_visual_pages": [page + 1 for page in nontext_visual_pages],
         "toc_completeness": completeness_diagnostics,
         "detected_page_offset": detected_offset,
         "offset_evidence_pages": offset_score,
@@ -1849,7 +2100,15 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     # under-declare artwork features such as transparency and soft masks.
     writer.pdf_header = reader.pdf_header
     borderless = ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)])
-    for link in added:
+    emit_progress(
+        "WRITING_LINKS",
+        completed=0,
+        total=len(added),
+        unit="link",
+        total_pages=page_count,
+        message=f"Adding {len(added)} verified link areas",
+    )
+    for link_number, link in enumerate(added, start=1):
         if link.kind == "internal":
             annotation = Link(
                 rect=link.rect,
@@ -1860,6 +2119,16 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         else:
             annotation = Link(rect=link.rect, border=borderless, url=str(link.uri))
         writer.add_annotation(link.source_page, annotation)
+        emit_progress(
+            "WRITING_LINKS",
+            completed=link_number,
+            total=len(added),
+            unit="link",
+            page=link.source_page + 1,
+            total_pages=page_count,
+            message=f"Added link {link_number} of {len(added)}",
+            counts={"links_added": link_number},
+        )
 
     staged_pdf = sibling_temporary_path(output_path, ".pdf")
     staged_report: Path | None = None
@@ -1890,6 +2159,15 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 raise RuntimeError(f"Page {index} rotation changed")
             if page_content_sha256(result_page) != source_content_hash:
                 raise RuntimeError(f"Page {index} content stream changed")
+            emit_progress(
+                "VALIDATING_PAGES",
+                completed=index,
+                total=page_count,
+                unit="page",
+                page=index,
+                total_pages=page_count,
+                message=f"Validated page {index} of {page_count}",
+            )
 
         result_visual_resources = visual_resource_state(result)
         for index, (source_digest, result_digest) in enumerate(

@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from pypdf import PdfReader
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, StreamObject
 
+from progress_events import emit_progress
 from skill_provenance import require_isolated_runtime
 
 
@@ -499,6 +500,15 @@ def verify(args: argparse.Namespace) -> dict:
     if len(source.pages) != len(output.pages):
         raise RuntimeError(f"Page count changed: {len(source.pages)} -> {len(output.pages)}")
     page_count = len(source.pages)
+    emit_progress(
+        "VERIFYING_PAGES",
+        completed=0,
+        total=page_count,
+        unit="page",
+        page=1,
+        total_pages=page_count,
+        message=f"Starting final verification of {page_count} pages",
+    )
     source_resource_cache: dict[tuple[int, int, int], bytes] = {}
     output_resource_cache: dict[tuple[int, int, int], bytes] = {}
     if catalog_visual_state_sha256(
@@ -525,22 +535,48 @@ def verify(args: argparse.Namespace) -> dict:
         if args.deep_content_check:
             if (source_page.extract_text() or "") != (output_page.extract_text() or ""):
                 raise RuntimeError(f"Page {index} extracted text changed")
+        emit_progress(
+            "VERIFYING_PAGES",
+            completed=index,
+            total=page_count,
+            unit="page",
+            page=index,
+            total_pages=page_count,
+            message=f"Verified page {index} of {page_count}",
+        )
 
     source_manifest = annotation_manifest(source)
     manifest = annotation_manifest(output)
     counts = Counter(item["kind"] for item in manifest)
-    if counts["internal"] + counts["external"] == 0:
+    verified_link_count = counts["internal"] + counts["external"]
+    if verified_link_count == 0:
         raise RuntimeError("No working internal or external links found")
     if args.require_internal and counts["internal"] == 0:
         raise RuntimeError("No internal links found")
     if args.require_external and counts["external"] == 0:
         raise RuntimeError("No external URI links found")
+    emit_progress(
+        "VERIFYING_LINKS",
+        completed=0,
+        total=verified_link_count,
+        unit="link",
+        total_pages=page_count,
+        message=f"Checking {verified_link_count} link destinations",
+    )
     link_errors, link_warnings = validate_links(output, manifest)
     if link_errors:
         preview = "; ".join(link_errors[:10])
         remainder = len(link_errors) - 10
         suffix = f"; plus {remainder} more" if remainder > 0 else ""
         raise RuntimeError(f"Link validation failed: {preview}{suffix}")
+    emit_progress(
+        "VERIFYING_LINKS",
+        completed=verified_link_count,
+        total=verified_link_count,
+        unit="link",
+        total_pages=page_count,
+        message=f"Verified all {verified_link_count} links",
+    )
 
     link_report_verification = (
         validate_link_report(

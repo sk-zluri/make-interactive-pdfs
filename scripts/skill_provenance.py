@@ -29,6 +29,8 @@ REQUIRED_RELEASE_FILES = (
     "references/dependencies.md",
     "references/heuristics-and-limitations.md",
     "scripts/make_interactive_pdf.py",
+    "scripts/local_ocr.py",
+    "scripts/progress_events.py",
     "scripts/verify_interactive_pdf.py",
     "scripts/run_isolated.py",
     "scripts/skill_provenance.py",
@@ -124,7 +126,18 @@ def file_hashes(skill_root: Path) -> dict[str, str]:
 
 
 def resolved_package_versions() -> dict[str, str | None]:
-    packages = ("pypdf", "pdfplumber", "pdfminer.six", "pypdfium2", "Pillow", "PyMuPDF")
+    packages = (
+        "pypdf",
+        "pdfplumber",
+        "pdfminer.six",
+        "pypdfium2",
+        "Pillow",
+        "PyMuPDF",
+        "rapidocr",
+        "onnxruntime",
+        "numpy",
+        "opencv-python",
+    )
     versions: dict[str, str | None] = {}
     for package in packages:
         try:
@@ -192,9 +205,49 @@ def collect_provenance(skill_root: Path = SKILL_ROOT) -> dict:
     }
 
 
+def collect_packaged_provenance() -> dict:
+    """Identify a frozen release without depending on a Git checkout or virtualenv."""
+
+    executable = Path(sys.executable).resolve()
+    bundle_root = Path(getattr(sys, "_MEIPASS", executable.parent)).resolve()
+    version_path = bundle_root / "VERSION"
+    executable_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+    return {
+        "schema_version": 1,
+        "skill": "make-interactive-pdfs",
+        "version": version_path.read_text(encoding="utf-8").strip(),
+        "canonical_repository": CANONICAL_REPOSITORY,
+        "git_repository": None,
+        "git_commit": None,
+        "git_dirty": None,
+        "expected_repository": None,
+        "repository_verified": None,
+        "expected_commit": None,
+        "commit_verified": None,
+        "advertised_head": None,
+        "remote_head_verified": None,
+        "bundle_sha256": executable_hash,
+        "files_sha256": {executable.name: executable_hash},
+        "runtime": {
+            "isolated": True,
+            "kind": "packaged-application",
+            "profile": "core",
+            "environment": str(executable.parent),
+            "python": platform.python_version(),
+            "packages": resolved_package_versions(),
+        },
+    }
+
+
 def require_isolated_runtime(skill_root: Path = SKILL_ROOT) -> dict:
     """Reject direct/shared-Python execution and return validated provenance."""
+    if os.environ.get("MAKE_INTERACTIVE_PDFS_PACKAGED") == "1":
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("Packaged-runtime mode requires a frozen application")
+        return collect_packaged_provenance()
+
     report = collect_provenance(skill_root)
+
     errors: list[str] = []
     declared_environment = report["runtime"].get("environment")
     if not report["runtime"]["isolated"] or not declared_environment:

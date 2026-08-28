@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta
+      name="description"
+      content="Add and verify links in a PDF without uploading it to a cloud service."
+    >
+    <title>Make Interactive PDFs</title>
+    <link rel="icon" href="/static/app-icon.png">
+    <script>
+      (() => {
+        try {
+          const savedTheme = window.localStorage.getItem("makeInteractivePdfsTheme");
+          if (savedTheme === "light" || savedTheme === "dark") {
+            document.documentElement.dataset.theme = savedTheme;
+          }
+          document.documentElement.dataset.effectiveTheme =
+            savedTheme === "light" || savedTheme === "dark"
+              ? savedTheme
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+        } catch (_error) {
+          // The system preference remains the safe default when storage is unavailable.
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to PDF tool</a>
+
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="/" aria-label="Make Interactive PDFs home">
+          <img
+            class="brand-mark"
+            src="/static/app-icon.png"
+            alt=""
+            aria-hidden="true"
+          >
+          <span>Make Interactive PDFs</span>
+        </a>
+        <div class="header-actions">
+          <a
+            class="creator-link"
+            href="https://www.linkedin.com/in/techhfreakk"
+            target="_blank"
+            rel="noopener noreferrer"
+          >Made with <span aria-hidden="true">❤️</span><span class="visually-hidden">love</span> by Sashank Kondepudi</a>
+          <span class="version-label" id="appVersion" aria-label="App version 1.3.3">v1.3.3</span>
+          <button
+            class="theme-toggle"
+            id="themeToggle"
+            type="button"
+            aria-label="Switch color theme"
+            title="Switch color theme"
+          >
+            <svg class="theme-icon theme-icon-sun" aria-hidden="true" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3.5"></circle>
+              <path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"></path>
+            </svg>
+            <svg class="theme-icon theme-icon-moon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M20 15.4A8.2 8.2 0 0 1 8.6 4a8.2 8.2 0 1 0 11.4 11.4Z"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="app-layout" id="workspace">
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">A LOCAL PDF UTILITY</p>
+        <h1 id="page-title">Make your PDF clickable.</h1>
+        <p class="intro-copy">
+          Add links to the table of contents, web addresses, and emails while keeping the original page design intact.
+        </p>
+
+        <div class="trust-block" aria-labelledby="trust-title">
+          <h2 id="trust-title">Your file stays in your hands</h2>
+          <ul class="trust-list">
+            <li>
+              <strong>No cloud upload</strong>
+              <span>Processing happens locally on this computer.</span>
+            </li>
+            <li>
+              <strong>Your original stays untouched</strong>
+              <span>The finished PDF is saved as a separate file.</span>
+            </li>
+            <li>
+              <strong>Checked before download</strong>
+              <span>If a link is uncertain, the app asks for review.</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="utility-panel" aria-label="PDF processing tool">
+        <div class="session-notice" id="sessionNotice" role="alert" hidden>
+          <strong>This session did not open correctly.</strong>
+          <span>Close this tab, then launch Make Interactive PDFs again.</span>
+        </div>
+
+        <noscript>
+          <div class="session-notice">
+            <strong>JavaScript is required.</strong>
+            <span>Enable JavaScript, then reopen the app.</span>
+          </div>
+        </noscript>
+
+        <section class="view" id="selectView" aria-labelledby="selectTitle">
+          <div class="view-heading">
+            <p class="view-kicker">Start here</p>
+            <h2 id="selectTitle" tabindex="-1">Choose one PDF</h2>
+            <p>The app will make a separate, verified copy.</p>
+          </div>
+
+          <label
+            class="drop-zone"
+            id="dropZone"
+            for="pdfInput"
+            role="button"
+            tabindex="0"
+            aria-describedby="dropHelp fileError"
+          >
+            <input
+              class="visually-hidden"
+              id="pdfInput"
+              name="pdf"
+              type="file"
+              accept="application/pdf,.pdf"
+            >
+            <span class="file-type-large" aria-hidden="true">PDF</span>
+            <span class="drop-title">Drop your PDF here</span>
+            <span class="drop-action">or choose from your computer</span>
+            <span class="drop-help" id="dropHelp">One PDF at a time</span>
+          </label>
+
+          <p class="inline-message" id="fileError" role="alert" hidden></p>
+        </section>
+
+        <section class="view" id="readyView" aria-labelledby="readyTitle" hidden>
+          <div class="view-heading">
+            <p class="view-kicker">Ready</p>
+            <h2 id="readyTitle" tabindex="-1">Your PDF is ready to process</h2>
+            <p>The original file will not be changed.</p>
+          </div>
+
+          <div class="selected-file">
+            <span class="file-type-small" aria-hidden="true">PDF</span>
+            <span class="file-details">
+              <strong id="selectedFileName"></strong>
+              <span id="selectedFileSize"></span>
+            </span>
+            <button class="text-button" id="chooseAnotherButton" type="button">Change</button>
+          </div>
+
+          <p class="inline-message inline-message-neutral" id="readyMessage" role="status" hidden></p>
+
+          <div class="button-row button-row-end">
+            <button class="button button-primary" id="startButton" type="button">
+              Make interactive
+            </button>
+          </div>
+        </section>
+
+        <section
+          class="view processing-view"
+          id="processingView"
+          aria-labelledby="processingTitle"
+          hidden
+        >
+          <div class="view-heading">
+            <p class="view-kicker">Working locally</p>
+            <h2 id="processingTitle" tabindex="-1">Processing your PDF</h2>
+            <p id="processingMessage">Starting the local processor.</p>
+          </div>
+
+          <div class="processing-file" aria-label="File being processed">
+            <span class="file-type-small" aria-hidden="true">PDF</span>
+            <strong id="processingFileName"></strong>
+          </div>
+
+          <div class="activity-overview" id="activityOverview">
+            <div class="scan-visual is-scanning" id="scanVisual" aria-hidden="true">
+              <span class="scan-line scan-line-long"></span>
+              <span class="scan-line"></span>
+              <span class="scan-line scan-line-short"></span>
+              <span class="scan-beam"></span>
+            </div>
+            <div class="activity-copy">
+              <p class="activity-label" id="activityLabel">Preparing your PDF</p>
+              <div class="activity-measure" id="activityMeasure" hidden>
+                <strong id="activityCurrent">0</strong>
+                <span class="activity-divider" aria-hidden="true">/</span>
+                <span id="activityTotal">0</span>
+              </div>
+              <p class="activity-unit" id="activityUnit">Starting locally</p>
+            </div>
+          </div>
+
+          <p
+            class="visually-hidden"
+            id="progressAnnouncement"
+            aria-live="polite"
+            aria-atomic="true"
+          ></p>
+
+          <div
+            class="progress-track"
+            id="progressTrack"
+            role="progressbar"
+            aria-label="PDF processing progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="4"
+          >
+            <span class="progress-fill" id="progressFill"></span>
+          </div>
+
+          <ol class="stage-list" id="stageList">
+            <li data-stage="PREFLIGHT">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <span>
+                <strong>Checking the PDF</strong>
+                <small>Confirming the file can be processed safely</small>
+              </span>
+              <span class="visually-hidden stage-status">Pending</span>
+            </li>
+            <li data-stage="ANALYZING">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <span>
+                <strong>Finding link targets</strong>
+                <small>Reading the contents and visible addresses</small>
+              </span>
+              <span class="visually-hidden stage-status">Pending</span>
+            </li>
+            <li data-stage="WRITING">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <span>
+                <strong>Adding links</strong>
+                <small>Creating a new copy of the PDF</small>
+              </span>
+              <span class="visually-hidden stage-status">Pending</span>
+            </li>
+            <li data-stage="VERIFYING">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <span>
+                <strong>Verifying the result</strong>
+                <small>Checking every link before download</small>
+              </span>
+              <span class="visually-hidden stage-status">Pending</span>
+            </li>
+          </ol>
+
+          <div class="activity-history" id="activityHistoryRegion" hidden>
+            <h3>Recent activity</h3>
+            <ol id="activityHistory"></ol>
+          </div>
+
+          <div class="button-row">
+            <button class="button button-secondary" id="cancelButton" type="button">Cancel</button>
+          </div>
+        </section>
+
+        <section class="view result-view" id="passView" aria-labelledby="passTitle" hidden>
+          <div class="result-label result-label-success">Verified</div>
+          <div class="view-heading">
+            <h2 id="passTitle" tabindex="-1">Your interactive PDF is ready</h2>
+            <p>Every link in the finished PDF passed the final check.</p>
+          </div>
+
+          <div class="result-summary" aria-label="Links in the finished PDF">
+            <div class="result-total">
+              <strong id="totalLinks">0</strong>
+              <span>links in the finished PDF</span>
+            </div>
+            <dl class="link-breakdown">
+              <div>
+                <dt>Contents</dt>
+                <dd id="contentsLinks">0</dd>
+              </div>
+              <div>
+                <dt>Web and email</dt>
+                <dd id="webLinks">0</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="button-stack">
+            <button class="button button-primary" id="downloadPdfButton" type="button">
+              Download interactive PDF
+            </button>
+            <button class="button button-secondary" id="downloadPassReportButton" type="button" hidden>
+              Download report
+            </button>
+          </div>
+          <p class="download-message" id="passDownloadMessage" aria-live="polite"></p>
+          <button class="text-button start-over-button" id="passStartOverButton" type="button">
+            Use another PDF
+          </button>
+        </section>
+
+        <section class="view result-view" id="reviewView" aria-labelledby="reviewTitle" hidden>
+          <div class="result-label">Needs review</div>
+          <div class="view-heading">
+            <h2 id="reviewTitle" tabindex="-1">This PDF needs a quick review</h2>
+            <p>No interactive PDF was created because some links could not be placed confidently.</p>
+          </div>
+
+          <div class="reason-block">
+            <h3>What needs attention</h3>
+            <ul id="reviewReasons"></ul>
+          </div>
+
+          <div class="button-stack">
+            <button class="button button-primary" id="downloadReviewReportButton" type="button">
+              Download review report
+            </button>
+          </div>
+          <p class="download-message" id="reviewDownloadMessage" aria-live="polite"></p>
+          <button class="text-button start-over-button" id="reviewStartOverButton" type="button">
+            Use another PDF
+          </button>
+        </section>
+
+        <section class="view result-view" id="failView" aria-labelledby="failTitle" hidden>
+          <div class="result-label">Could not finish</div>
+          <div class="view-heading">
+            <h2 id="failTitle" tabindex="-1">We could not process this PDF</h2>
+            <p id="failMessage">The file may be damaged or use a feature this version does not support.</p>
+          </div>
+
+          <div class="button-row button-row-wrap">
+            <button class="button button-primary" id="retryButton" type="button">Try again</button>
+            <button class="button button-secondary" id="failStartOverButton" type="button">
+              Choose another PDF
+            </button>
+          </div>
+        </section>
+
+        <section class="view result-view closed-view" id="closedView" aria-labelledby="closedTitle" hidden>
+          <div class="result-label">Connection ended</div>
+          <div class="view-heading">
+            <h2 id="closedTitle" tabindex="-1">Local app is closed</h2>
+            <p id="closedMessage">
+              Reopen the Make Interactive PDFs EXE to start a new private session.
+            </p>
+          </div>
+          <div class="closed-instruction">
+            <strong>Your PDF is still private.</strong>
+            <span>Nothing was sent to a cloud service.</span>
+          </div>
+        </section>
+
+        <p class="panel-footnote">Nothing is sent to a cloud service.</p>
+      </section>
+    </main>
+
+  </body>
+</html>

@@ -33,23 +33,22 @@ Hidden destinations cannot be inferred from labels such as `Privacy Policy` afte
 
 ## Scanned PDFs and OCR
 
-An existing OCR text layer may provide usable word coordinates even when no fonts are embedded. Run the normal analyzer first. If it returns `NEEDS_REVIEW`, OCR only the flagged TOC number columns and pagination boundaries when practical; full-document OCR is usually unnecessary and slow.
+The analyzer judges each page independently. Healthy selectable text is used directly even when a full-page scan sits behind it. Local OCR runs only when text is missing, too sparse for the visible page, or clearly corrupted; structural blanks and conservatively detected blank scans are skipped. Rotated scans are normalized for OCR and mapped back to the source page's PDF coordinate system. OCR words pass through the same TOC, pagination, URL, and fail-closed verification logic as native PDF words.
 
-This skill does not install system OCR software. Use an already approved task-local tool or user-managed installation:
+The tool uses exact-pinned RapidOCR and ONNX Runtime packages inside its checkout-owned environment; it never installs OCR system-wide:
 
-- OCRmyPDF: https://ocrmypdf.readthedocs.io/
-- Tesseract: https://github.com/tesseract-ocr/tesseract
+- RapidOCR: https://github.com/RapidAI/RapidOCR
+- ONNX Runtime: https://onnxruntime.ai/
 
-If no owned OCR tool is available, inspect the flagged pages and create a reviewed manifest. Never publish the partial automatic candidate.
+OCR never rewrites page artwork or creates a replacement text layer. Reports record why pages were selected, which pages were skipped as blank, and whether OCR replaced, merged with, or could not safely improve existing text. A page-level OCR engine failure or unresolved corrupted text forces `NEEDS_REVIEW`; an honestly blank page does not. If ambiguity remains, inspect the flagged pages and create a reviewed manifest. Never publish a partial automatic candidate.
 
 ## Unsupported or review-required cases
 
 - Damaged or malformed PDFs that pypdf/pdfplumber cannot parse.
-- Image-only navigation pages without OCR coordinates.
+- Image-only navigation pages whose local OCR does not produce safe word coordinates.
 - Digital signatures unless invalidation is explicitly authorized.
 - Encrypted input without a password; output is a decrypted copy.
 - XFA, portfolios, embedded-file workflows, or forms whose behavior depends on incremental updates.
 - Reference PDFs with different page count or dimensions.
-- Rotated navigation/URL pages whose extracted coordinates cannot be safely transformed; these return `NEEDS_REVIEW` instead of publishing invalid rectangles.
 
 For same-layout compressed PDFs, `--reference-pdf` remains the safest restoration route. It copies link rectangles and destinations without OCR while preserving the compressed source artwork.
