@@ -1016,12 +1016,12 @@ h1 {
 .scan-line {
   position: absolute;
   top: 35px;
-  left: 50%;
+  left: calc(50% - 24px);
   width: 39px;
   height: 3px;
   border-radius: var(--radius);
   background: var(--border);
-  transform: translateX(-50%);
+  transform: none;
 }
 
 .scan-line-long {
@@ -1364,13 +1364,6 @@ body.is-processing .panel-footnote {
     --scan-travel: 68px;
     width: 62px;
     height: 82px;
-  }
-
-  .scan-line,
-  .scan-line-long,
-  .scan-line-short {
-    left: 50%;
-    max-width: calc(100% - 24px);
   }
 
   .scan-beam {

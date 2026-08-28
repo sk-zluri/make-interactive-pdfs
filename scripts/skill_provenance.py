@@ -20,6 +20,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_REPOSITORY = "https://github.com/sk-zluri/make-interactive-pdfs"
 REQUIRED_RELEASE_FILES = (
     ".gitignore",
+    "LICENSE",
     "VERSION",
     "SKILL.md",
     "requirements.txt",

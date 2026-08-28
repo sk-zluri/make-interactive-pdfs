@@ -18,6 +18,7 @@ datas = [
 ]
 for relative in (
     "VERSION",
+    "LICENSE",
 ):
     datas.append((str(ROOT / relative), "."))
 datas += collect_data_files("pdfminer")

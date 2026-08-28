@@ -109,7 +109,7 @@ def main() -> int:
         )
         if provenance["status"] != "PASS" or not provenance["repository_verified"]:
             raise RuntimeError(provenance)
-        if provenance["version"] != "1.3.3" or len(provenance["git_commit"] or "") != 40:
+        if provenance["version"] != "1.3.4" or len(provenance["git_commit"] or "") != 40:
             raise RuntimeError(provenance)
         pinned_provenance = run_json(
             [
@@ -412,7 +412,7 @@ def main() -> int:
             raise RuntimeError(data)
         if data["pdf_version"] != {"header": "%PDF-1.4", "catalog": "/1.7"}:
             raise RuntimeError(data)
-        if data["skill_provenance"]["version"] != "1.3.3":
+        if data["skill_provenance"]["version"] != "1.3.4":
             raise RuntimeError(data["skill_provenance"])
         if not data["skill_provenance"]["bundle_sha256"]:
             raise RuntimeError(data["skill_provenance"])

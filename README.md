@@ -17,7 +17,7 @@ Make Interactive PDFs can add:
 
 [Download the latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest)
 
-1. Download `Make Interactive PDFs v1.3.3.zip`.
+1. Download `Make.Interactive.PDFs.v1.3.4.zip`.
 2. Extract the entire ZIP to a folder.
 3. Double-click `Make Interactive PDFs.exe`.
 4. Keep the small desktop window open while using the workspace in Chrome.
@@ -73,6 +73,10 @@ py -3.11 scripts\run_isolated.py self-test
 .\.venv\Scripts\python.exe scripts\run_isolated.py --venv-dir .venv self-test
 .\.venv\Scripts\python.exe scripts\run_isolated.py --venv-dir .venv regression-test
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). Bundled third-party components remain under their respective licenses.
 
 ## Creator
 
