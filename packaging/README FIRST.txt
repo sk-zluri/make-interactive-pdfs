@@ -1,4 +1,4 @@
-MAKE INTERACTIVE PDFS - PORTABLE WINDOWS BUILD 1.3.4
+MAKE INTERACTIVE PDFS - PORTABLE WINDOWS BUILD 1.3.5
 
 1. Keep the entire folder together.
 2. Double-click "Make Interactive PDFs.exe".
@@ -11,3 +11,4 @@ This portable build is not code-signed yet. Windows may show a warning. If it do
 "More info" and then "Run anyway" only if you received this folder from the project owner.
 
 This app is released under the MIT License. See LICENSE.txt.
+Third-party software keeps its original licences. See THIRD_PARTY_NOTICES.md.

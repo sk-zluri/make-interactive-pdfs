@@ -15,7 +15,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -33,13 +33,21 @@ from pypdf.generic import (
     StreamObject,
 )
 
-from local_ocr import OCRSummary, ocr_low_text_pages
+from local_ocr import (
+    NavigationOCRSummary,
+    OCRSummary,
+    ocr_low_text_pages,
+    ocr_navigation_columns,
+)
 from progress_events import emit_progress
 from skill_provenance import require_isolated_runtime
 
 
 TOC_HEADINGS = ("table of contents", "contents", "agenda", "index")
 PAGE_TOKEN_RE = re.compile(r"^[\s.·•()\[\]-]*([0-9]{1,4}|[ivxlcdm]{1,10})[\s.·•()\[\]-]*$", re.I)
+PAGE_RANGE_RE = re.compile(
+    r"^[\s.·•()\[\]]*([0-9]{1,4})\s*[-–—―�]+\s*([0-9]{1,4})[\s.·•()\[\]]*$"
+)
 ORDINAL_TOKEN_RE = re.compile(r"^\s*([0-9]{1,4}|[ivxlcdm]{1,10})[.·):\-]+\s*$", re.I)
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}$", re.I)
 URL_RE = re.compile(r"^(?:https?://|www\.)[^\s<>]+$", re.I)
@@ -61,6 +69,9 @@ class TocRow:
     printed_number: int
     label_kind: str
     rect: tuple[float, float, float, float]
+    label_candidates: tuple[tuple[int, str], ...] = ()
+    ordinal: int | None = None
+    navigation_ocr: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,13 @@ class PageLabelObservation:
     printed_number: int
     label_kind: str
     raw: str
+    top: float | None = None
+    bottom: float | None = None
+    x0: float | None = None
+    x1: float | None = None
+    page_width: float | None = None
+    page_height: float | None = None
+    has_inline_text_neighbor: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,6 +228,96 @@ def parse_page_label(value: str) -> int | None:
     return parsed[0] if parsed else None
 
 
+def page_label_candidates(value: str) -> list[tuple[int, str]]:
+    """Return strict and OCR-confusable page-label interpretations.
+
+    These are candidates only. Callers must use pagination and title evidence
+    before accepting a non-strict interpretation.
+    """
+
+    raw = str(value).strip()
+    results: list[tuple[int, str]] = []
+
+    def add(number: int | None, kind: str) -> None:
+        if number is not None and 0 < number <= 3999 and (number, kind) not in results:
+            results.append((number, kind))
+
+    strict = parse_page_label_details(raw)
+    if strict is not None:
+        add(*strict)
+
+    compact = re.sub(r"[^A-Za-z0-9]", "", raw)
+    if not compact:
+        return results
+
+    digit_translation = str.maketrans(
+        {
+            "I": "1",
+            "i": "1",
+            "L": "1",
+            "l": "1",
+            "O": "0",
+            "o": "0",
+            "Z": "2",
+            "z": "2",
+            "S": "5",
+            "s": "5",
+        }
+    )
+    digit_candidate = compact.translate(digit_translation)
+    if digit_candidate.isdigit():
+        add(int(digit_candidate), "arabic")
+
+    roman_candidate = compact.upper()
+    if roman_candidate.endswith("U"):
+        roman_candidate = roman_candidate[:-1] + "II"
+    roman_candidate = roman_candidate.replace("L", "I")
+    if roman_candidate and re.fullmatch(r"[IVXLCDM]+", roman_candidate):
+        add(roman_to_int(roman_candidate), "roman")
+
+    return results
+
+
+def rotated_page_label_candidate(value: str) -> int | None:
+    """Return a possible 180-degree numeric reading for targeted OCR only."""
+
+    compact = re.sub(r"\D", "", str(value))
+    if not compact:
+        return None
+    rotated = compact[::-1].translate(str.maketrans({"6": "9", "9": "6"}))
+    if rotated == compact or not rotated.isdigit():
+        return None
+    number = int(rotated)
+    return number if 0 < number <= 3999 else None
+
+
+def page_range_candidates(
+    value: str,
+    *,
+    maximum: int = 9999,
+    allow_compact: bool = False,
+) -> list[tuple[int, int]]:
+    """Parse an Arabic range; compact guesses require page-layout evidence."""
+
+    raw = str(value).strip()
+    explicit = PAGE_RANGE_RE.fullmatch(raw)
+    if explicit:
+        start, end = int(explicit.group(1)), int(explicit.group(2))
+        return [(start, end)] if 0 < start <= end <= maximum else []
+    if not allow_compact:
+        return []
+    compact = re.sub(r"\D", "", raw)
+    if len(compact) < 2 or len(compact) > 8:
+        return []
+    candidates: list[tuple[int, int]] = []
+    for split in range(1, len(compact)):
+        start, end = int(compact[:split]), int(compact[split:])
+        if 0 < start <= end <= maximum and (start, end) not in candidates:
+            candidates.append((start, end))
+    candidates.sort(key=lambda item: (item[1] - item[0], abs(len(str(item[0])) - len(str(item[1])))))
+    return candidates
+
+
 def group_words_into_lines(words: Sequence[dict], tolerance: float = 3.0) -> list[list[dict]]:
     lines: list[list[dict]] = []
     for word in sorted(words, key=lambda item: (float(item["top"]), float(item["x0"]))):
@@ -226,18 +334,559 @@ def group_words_into_lines(words: Sequence[dict], tolerance: float = 3.0) -> lis
     return lines
 
 
+def _is_toc_heading_text(normalized: str) -> bool:
+    is_named_volume = bool(
+        re.fullmatch(
+            r"(?:table of contents|contents) (?:volume|part|book) "
+            r"(?:[0-9]{1,3}|[ivxlcdm]{1,10})",
+            normalized,
+            flags=re.I,
+        )
+    )
+    return (
+        normalized in TOC_HEADINGS
+        or normalized in {f"{heading} continued" for heading in TOC_HEADINGS}
+        or is_named_volume
+    )
+
+
+def toc_heading_line(words: Sequence[dict], page_height: float) -> list[dict] | None:
+    """Return an exact, top-of-page TOC heading line.
+
+    A prose sentence merely containing the word ``contents`` is deliberately
+    not a heading.
+    """
+
+    lines = group_words_into_lines(words, tolerance=4.0)
+    top_lines = [
+        line
+        for line in lines
+        if line and min(float(word["top"]) for word in line) <= page_height * 0.34
+    ]
+    for first, second in zip(top_lines, top_lines[1:]):
+        first_bottom = max(float(word["bottom"]) for word in first)
+        second_top = min(float(word["top"]) for word in second)
+        first_height = first_bottom - min(float(word["top"]) for word in first)
+        second_height = max(float(word["bottom"]) for word in second) - second_top
+        if second_top - first_bottom > max(12.0, 2.5 * max(first_height, second_height)):
+            continue
+        combined = normalize_text(
+            " ".join(str(word["text"]) for word in (*first, *second))
+        )
+        if _is_toc_heading_text(combined):
+            return [*first, *second]
+
+    for line in lines:
+        if not line:
+            continue
+        top = min(float(word["top"]) for word in line)
+        if top > page_height * 0.34:
+            continue
+        normalized = normalize_text(" ".join(str(word["text"]) for word in line))
+        is_named_volume = bool(
+            re.fullmatch(
+                r"(?:table of contents|contents) (?:volume|part|book) "
+                r"(?:[0-9]{1,3}|[ivxlcdm]{1,10})",
+                normalized,
+                flags=re.I,
+            )
+        )
+        if (
+            normalized in TOC_HEADINGS
+            or normalized in {f"{heading} continued" for heading in TOC_HEADINGS}
+            or is_named_volume
+        ):
+            return line
+    return None
+
+
+def has_toc_heading_line(analysis: PageAnalysis) -> bool:
+    return toc_heading_line(analysis.words, analysis.height) is not None
+
+
+def _row_rect(page, row_words: Sequence[dict]) -> tuple[float, float, float, float]:
+    x0 = max(0.0, min(float(word["x0"]) for word in row_words) - 1.5)
+    x1 = min(float(page.width), max(float(word["x1"]) for word in row_words) + 1.5)
+    top = max(0.0, min(float(word["top"]) for word in row_words) - 1.5)
+    bottom = min(float(page.height), max(float(word["bottom"]) for word in row_words) + 1.5)
+    return visual_rect_to_pdf(
+        x0,
+        top,
+        x1,
+        bottom,
+        width=float(page.width),
+        height=float(page.height),
+        rotation=int(getattr(page, "rotation", 0)),
+    )
+
+
+def _semantic_range_rows(page_index: int, page, words: Sequence[dict]) -> list[TocRow]:
+    """Parse SECTION metadata followed by title + Arabic page-range rows."""
+
+    section_words = [
+        word for word in words if normalize_text(str(word.get("text", ""))) == "section"
+    ]
+    explicit_range_present = any(
+        float(word.get("x0", 0.0)) >= float(page.width) * 0.72
+        and PAGE_RANGE_RE.fullmatch(str(word.get("text", "")).strip())
+        for word in words
+    )
+    if len(section_words) < 3 and not (section_words and explicit_range_present):
+        return []
+
+    explicit_range_count = sum(
+        bool(PAGE_RANGE_RE.fullmatch(str(word.get("text", "")).strip()))
+        for word in words
+        if float(word.get("x0", 0.0)) >= float(page.width) * 0.72
+    )
+    has_page_column_heading = any(
+        normalize_text(str(word.get("text", ""))) == "page"
+        and float(word.get("x0", 0.0)) >= float(page.width) * 0.65
+        for word in words
+    )
+    allow_compact_ranges = (
+        len(section_words) >= 3
+        and explicit_range_count >= 2
+        and has_page_column_heading
+    )
+
+    anchors: list[tuple[dict, list[tuple[int, int]]]] = []
+    for word in words:
+        if bool(word.get("ocr_navigation")):
+            continue
+        if float(word["x0"]) < float(page.width) * 0.72:
+            continue
+        candidates = page_range_candidates(
+            str(word.get("text", "")),
+            maximum=9999,
+            allow_compact=allow_compact_ranges,
+        )
+        if candidates:
+            anchors.append((word, [candidates[0]]))
+    anchors.sort(key=lambda item: (float(item[0]["top"]), float(item[0]["x0"])))
+    if len(anchors) < 1:
+        return []
+    if allow_compact_ranges and len(anchors) >= 3:
+        transitions = [
+            next_ranges[0][0] - previous_ranges[0][1]
+            for (_, previous_ranges), (_, next_ranges) in zip(anchors, anchors[1:])
+        ]
+        contiguous = sum(delta in {0, 1} for delta in transitions)
+        if contiguous / len(transitions) < 0.8:
+            return []
+
+    rows: list[TocRow] = []
+    previous_bottom = 0.0
+    for index, (anchor, ranges) in enumerate(anchors):
+        anchor_top = float(anchor["top"])
+        following_top = (
+            float(anchors[index + 1][0]["top"]) if index + 1 < len(anchors) else float(page.height)
+        )
+        nearby_titles = [
+            word
+            for word in words
+            if float(word["x0"]) < float(page.width) * 0.55
+            and previous_bottom - 2.0 <= float(word["top"]) <= min(following_top, anchor_top + 13.0)
+            and abs(float(word["top"]) - anchor_top) <= 13.0
+            and normalize_text(str(word.get("text", ""))) != "section"
+            and parse_page_label_details(str(word.get("text", ""))) is None
+        ]
+        nearby_titles.sort(key=lambda word: (float(word["top"]), float(word["x0"])))
+        title = " ".join(str(word["text"]) for word in nearby_titles)
+        title = re.sub(r"\s+", " ", title).strip(" .·•-–—\t")
+        if len(normalize_text(title)) < 3:
+            previous_bottom = float(anchor["bottom"])
+            continue
+
+        metadata = [
+            word
+            for word in words
+            if max(anchor_top - 40.0, previous_bottom + 0.1)
+            <= float(word["top"])
+            <= anchor_top + 13.0
+            and (
+                normalize_text(str(word.get("text", ""))) == "section"
+                or re.fullmatch(r"[IVXLCDM^\-]+", str(word.get("text", "")).upper())
+            )
+        ]
+        section_ordinal = None
+        for word in metadata:
+            raw_metadata = str(word.get("text", "")).upper().replace("^", "")
+            match = re.fullmatch(
+                r"([IVXLCDM]+)(?:[-–—]([IVXLCDM]+))?",
+                raw_metadata,
+            )
+            if match:
+                section_ordinal = roman_to_int(match.group(1))
+                if section_ordinal is not None:
+                    break
+        row_words = [*metadata, *nearby_titles, anchor]
+        start, _ = ranges[0]
+        rows.append(
+            TocRow(
+                page_index,
+                title,
+                str(anchor["text"]),
+                start,
+                "arabic",
+                _row_rect(page, row_words),
+                tuple((candidate_start, "arabic") for candidate_start, _ in ranges),
+                ordinal=section_ordinal,
+            )
+        )
+        previous_bottom = float(anchor["bottom"])
+    return rows
+
+
+def has_section_range_layout(words: Sequence[dict]) -> bool:
+    section_count = sum(
+        normalize_text(str(word.get("text", ""))) == "section" for word in words
+    )
+    return section_count >= 3 or (
+        section_count >= 1
+        and any(
+            PAGE_RANGE_RE.fullmatch(str(word.get("text", "")).strip())
+            for word in words
+        )
+    )
+
+
+def _toc_ordinal(value: str) -> int | None:
+    compact = re.sub(r"[^A-Za-z0-9]", "", str(value))
+    if not compact:
+        return None
+    translated = compact.translate(
+        str.maketrans(
+            {
+                "I": "1",
+                "i": "1",
+                "L": "1",
+                "l": "1",
+                "O": "0",
+                "o": "0",
+                "Z": "2",
+                "z": "2",
+                "S": "5",
+                "s": "5",
+            }
+        )
+    )
+    if translated.isdigit():
+        number = int(translated)
+        return number if 0 < number <= 999 else None
+    return None
+
+
+def _navigation_anchor_rows(page_index: int, page, words: Sequence[dict]) -> list[TocRow]:
+    """Build one semantic row per OCR-confirmed right-column page label."""
+
+    if not any(bool(word.get("ocr_navigation")) for word in words):
+        return []
+
+    width, height = float(page.width), float(page.height)
+    source_groups: list[tuple[float, float, list[dict], list[tuple[int, str]], str, bool]] = []
+    for navigation_only in (True, False):
+        source_words = [
+            word
+            for word in words
+            if bool(word.get("ocr_navigation")) is navigation_only
+        ]
+        for line in group_words_into_lines(source_words, tolerance=2.0):
+            minimum_x0 = width * (0.84 if navigation_only else 0.83)
+            right_words = [
+                word
+                for word in line
+                if (
+                    float(word["x0"]) >= minimum_x0
+                    or (
+                        not navigation_only
+                        and float(word["x0"]) >= width * 0.78
+                        and sum(
+                            character.isdigit()
+                            for character in str(word.get("text", ""))
+                        )
+                        >= 2
+                    )
+                )
+                and float(word["bottom"]) - float(word["top"]) <= height * 0.03
+            ]
+            if not right_words or max(float(word["x1"]) for word in right_words) < width * 0.87:
+                continue
+            right_words.sort(key=lambda word: float(word["x0"]))
+            raw = "".join(str(word.get("text", "")) for word in right_words)
+            candidates = page_label_candidates(raw)
+            if not candidates:
+                for word in right_words:
+                    for candidate in page_label_candidates(str(word.get("text", ""))):
+                        if candidate not in candidates:
+                            candidates.append(candidate)
+            if not candidates:
+                continue
+            top = min(float(word["top"]) for word in right_words)
+            bottom = max(float(word["bottom"]) for word in right_words)
+            if top <= height * 0.08 or top >= height * 0.94:
+                continue
+            source_groups.append(
+                (top, bottom, right_words, candidates, raw, navigation_only)
+            )
+
+    source_groups.sort(key=lambda item: (item[0], not item[5]))
+    clusters: list[dict] = []
+    for top, bottom, label_words, candidates, raw, navigation_only in source_groups:
+        center = (top + bottom) / 2
+        shared_candidate = bool(
+            clusters
+            and set(candidates).intersection(clusters[-1]["candidates"])
+        )
+        vertical_overlap = (
+            max(
+                0.0,
+                min(bottom, float(clusters[-1]["bottom"]))
+                - max(top, float(clusters[-1]["top"])),
+            )
+            if clusters
+            else 0.0
+        )
+        different_sources = bool(
+            clusters
+            and any(
+                bool(existing_navigation) is not navigation_only
+                for _, existing_navigation in clusters[-1]["raw"]
+            )
+        )
+        overlap_ratio = (
+            vertical_overlap
+            / max(
+                0.001,
+                min(bottom - top, float(clusters[-1]["bottom"]) - float(clusters[-1]["top"])),
+            )
+            if clusters
+            else 0.0
+        )
+        if clusters and (
+            abs(center - float(clusters[-1]["center"])) <= 2.0
+            or (
+                shared_candidate
+                and abs(center - float(clusters[-1]["center"])) <= 5.5
+            )
+            or (different_sources and overlap_ratio >= 0.45)
+        ):
+            cluster = clusters[-1]
+            cluster["top"] = min(float(cluster["top"]), top)
+            cluster["bottom"] = max(float(cluster["bottom"]), bottom)
+            cluster["words"].extend(label_words)
+            cluster["raw"].append((raw, navigation_only))
+            for candidate in candidates:
+                if candidate not in cluster["candidates"]:
+                    cluster["candidates"].append(candidate)
+            cluster["center"] = (float(cluster["top"]) + float(cluster["bottom"])) / 2
+        else:
+            clusters.append(
+                {
+                    "top": top,
+                    "bottom": bottom,
+                    "center": center,
+                    "words": list(label_words),
+                    "candidates": list(candidates),
+                    "raw": [(raw, navigation_only)],
+                }
+            )
+
+    heading = toc_heading_line(words, height)
+    heading_bottom = max((float(word["bottom"]) for word in heading or ()), default=height * 0.08)
+    clusters = [cluster for cluster in clusters if float(cluster["top"]) > heading_bottom + 4.0]
+
+    expanded_clusters: list[dict] = []
+    for index, cluster in enumerate(clusters):
+        previous_number = (
+            int(expanded_clusters[-1]["candidates"][0][0])
+            if expanded_clusters
+            else 0
+        )
+        next_number = (
+            int(clusters[index + 1]["candidates"][0][0])
+            if index + 1 < len(clusters)
+            else 4000
+        )
+        plausible = sorted(
+            {
+                int(number)
+                for number, kind in cluster["candidates"]
+                if kind == "arabic" and previous_number < int(number) < next_number
+            }
+        )
+        raw_digit_options = [
+            re.sub(r"\D", "", raw)
+            for raw, _ in cluster["raw"]
+            if re.sub(r"\D", "", raw)
+        ]
+        primary_number = int(cluster["candidates"][0][0])
+        if (
+            len(plausible) < 2
+            and not (previous_number < primary_number < next_number)
+        ):
+            for compact in raw_digit_options:
+                for split in range(1, len(compact)):
+                    first, second = int(compact[:split]), int(compact[split:])
+                    if previous_number < first < second < next_number:
+                        plausible = [first, second]
+                        break
+                if len(plausible) >= 2:
+                    break
+
+        if len(plausible) < 2:
+            expanded_clusters.append(cluster)
+            continue
+
+        slice_height = max(
+            1.0,
+            (float(cluster["bottom"]) - float(cluster["top"])) / len(plausible),
+        )
+        for part, number in enumerate(plausible):
+            child = dict(cluster)
+            child_top = float(cluster["top"]) + part * slice_height
+            child_bottom = (
+                float(cluster["bottom"])
+                if part + 1 == len(plausible)
+                else child_top + slice_height
+            )
+            template = dict(cluster["words"][0])
+            template.update(
+                {
+                    "text": str(number),
+                    "top": child_top,
+                    "bottom": child_bottom,
+                }
+            )
+            child.update(
+                {
+                    "top": child_top,
+                    "bottom": child_bottom,
+                    "center": (child_top + child_bottom) / 2,
+                    "words": [template],
+                    "candidates": [(number, "arabic")],
+                    "raw": [(str(number), True)],
+                }
+            )
+            expanded_clusters.append(child)
+    clusters = expanded_clusters
+
+    rows: list[TocRow] = []
+    heading_word_ids = {id(word) for word in heading or ()}
+    for cluster_index, cluster in enumerate(clusters):
+        top = max(
+            heading_bottom + 0.25,
+            (
+                (
+                    float(clusters[cluster_index - 1]["center"])
+                    + float(cluster["center"])
+                )
+                / 2
+                if cluster_index > 0
+                else heading_bottom + 0.25
+            ),
+        )
+        bottom = min(
+            height,
+            (
+                (
+                    float(cluster["center"])
+                    + float(clusters[cluster_index + 1]["center"])
+                )
+                / 2
+                if cluster_index + 1 < len(clusters)
+                else float(cluster["bottom"]) + 2.5
+            ),
+        )
+        title_words = [
+            word
+            for word in words
+            if not bool(word.get("ocr_navigation"))
+            and id(word) not in heading_word_ids
+            and float(word["x0"]) < width * 0.80
+            and float(word["bottom"]) >= top - 1.0
+            and float(word["top"]) <= bottom
+        ]
+        title_words.sort(key=lambda word: (float(word["top"]), float(word["x0"])))
+        title = " ".join(str(word.get("text", "")) for word in title_words)
+        title = re.sub(r"^\s*[A-Za-z0-9]{1,4}[.·):\-]+\s*", "", title)
+        title = re.sub(r"(?:\s*[-–—·•�]\s*){2,}", " ", title)
+        title = re.sub(r"\s+", " ", title).strip(" .·•-–—\t")
+        normalized = normalize_text(title)
+        if normalized in TOC_HEADINGS or normalized in {"chapter page", "page"}:
+            title = ""
+        if len(normalize_text(title)) < 3:
+            title = f"Contents entry {len(rows) + 1}"
+
+        candidates = tuple(cluster["candidates"])
+        label, label_kind = candidates[0]
+        raw_options = sorted(cluster["raw"], key=lambda item: not item[1])
+        raw_label = raw_options[0][0]
+        ordinal = None
+        left_edge_words = sorted(
+            (word for word in title_words if float(word["x0"]) <= width * 0.30),
+            key=lambda word: (
+                abs(
+                    (float(word["top"]) + float(word["bottom"])) / 2
+                    - float(cluster["center"])
+                ),
+                float(word["x0"]),
+            ),
+        )
+        for word in left_edge_words:
+            ordinal = _toc_ordinal(str(word.get("text", "")))
+            if ordinal is not None:
+                break
+
+        row_words = [*title_words, *cluster["words"]]
+        row_x0 = max(0.0, min(float(word["x0"]) for word in row_words) - 1.0)
+        row_x1 = min(width, max(float(word["x1"]) for word in row_words) + 1.0)
+        row_rect = visual_rect_to_pdf(
+            row_x0,
+            top,
+            row_x1,
+            bottom,
+            width=width,
+            height=height,
+            rotation=int(getattr(page, "rotation", 0)),
+        )
+
+        rows.append(
+            TocRow(
+                page_index,
+                title,
+                raw_label,
+                label,
+                label_kind,
+                row_rect,
+                candidates,
+                ordinal,
+                any(is_navigation for _, is_navigation in cluster["raw"]),
+            )
+        )
+    return rows
+
+
 def toc_rows_for_page(page_index: int, page, words: Sequence[dict] | None = None) -> list[TocRow]:
     words = list(words) if words is not None else page.extract_words(
         use_text_flow=False, keep_blank_chars=False
     )
+    range_rows = _semantic_range_rows(page_index, page, words)
+    if range_rows:
+        return range_rows
+    navigation_rows = _navigation_anchor_rows(page_index, page, words)
+    if navigation_rows:
+        return navigation_rows
+
     rows: list[TocRow] = []
     for line in group_words_into_lines(words):
         if len(line) < 2:
             continue
-        parsed = parse_page_label_details(str(line[-1]["text"]))
-        if parsed is None or parsed[0] <= 0:
+        raw_label = str(line[-1]["text"])
+        candidates = page_label_candidates(raw_label)
+        if not candidates or candidates[0][0] <= 0:
             continue
-        label, label_kind = parsed
+        label, label_kind = candidates[0]
         if float(line[-1]["x0"]) < float(page.width) * 0.55:
             continue
         title = " ".join(str(word["text"]) for word in line[:-1])
@@ -245,20 +894,17 @@ def toc_rows_for_page(page_index: int, page, words: Sequence[dict] | None = None
         normalized = normalize_text(title)
         if len(normalized) < 3 or normalized in TOC_HEADINGS:
             continue
-        x0 = max(0.0, min(float(word["x0"]) for word in line) - 1.5)
-        x1 = min(float(page.width), max(float(word["x1"]) for word in line) + 1.5)
-        top = max(0.0, min(float(word["top"]) for word in line) - 1.5)
-        bottom = min(float(page.height), max(float(word["bottom"]) for word in line) + 1.5)
-        rect = visual_rect_to_pdf(
-            x0,
-            top,
-            x1,
-            bottom,
-            width=float(page.width),
-            height=float(page.height),
-            rotation=int(getattr(page, "rotation", 0)),
+        rows.append(
+            TocRow(
+                page_index,
+                title,
+                raw_label,
+                label,
+                label_kind,
+                _row_rect(page, line),
+                tuple(candidates),
+            )
         )
-        rows.append(TocRow(page_index, title, str(line[-1]["text"]), label, label_kind, rect))
     return rows
 
 
@@ -266,14 +912,16 @@ def margin_label_observations(
     page_index: int, width: float, height: float, words: Sequence[dict], page_count: int
 ) -> list[PageLabelObservation]:
     observations: list[PageLabelObservation] = []
-    seen: set[tuple[int, str]] = set()
+    seen: set[tuple[int, str, bool]] = set()
     for word in words:
         top = float(word["top"])
         if not (top <= height * 0.08 or top >= height * 0.88):
             continue
         x0, x1 = float(word["x0"]), float(word["x1"])
         center = (x0 + x1) / 2
-        if not (x0 <= width * 0.22 or x1 >= width * 0.78 or abs(center - width / 2) <= width * 0.12):
+        centered = abs(center - width / 2) <= width * 0.12
+        in_outer_corner = x0 <= width * 0.22 or x1 >= width * 0.78
+        if not (in_outer_corner or centered):
             continue
         parsed = parse_page_label_details(str(word["text"]))
         if parsed is None:
@@ -281,11 +929,53 @@ def margin_label_observations(
         number, label_kind = parsed
         if number <= 0 or number > max(100, page_count * 3):
             continue
-        key = (number, label_kind)
+
+        has_inline_text_neighbor = False
+        if in_outer_corner and not centered and top >= height * 0.88:
+            word_top = float(word["top"])
+            word_bottom = float(word["bottom"])
+            word_height = max(0.1, word_bottom - word_top)
+            gap_limit = max(4.0, min(10.0, width * 0.02))
+            for other in words:
+                if other is word or not re.search(r"[A-Za-z]", str(other["text"])):
+                    continue
+                other_top = float(other["top"])
+                other_bottom = float(other["bottom"])
+                if min(word_bottom, other_bottom) <= max(word_top, other_top):
+                    continue
+                other_height = max(0.1, other_bottom - other_top)
+                if word_height > other_height * 0.8:
+                    continue
+                other_x0 = float(other["x0"])
+                other_x1 = float(other["x1"])
+                if other_x0 >= x1:
+                    horizontal_gap = other_x0 - x1
+                elif x0 >= other_x1:
+                    horizontal_gap = x0 - other_x1
+                else:
+                    horizontal_gap = 0.0
+                if horizontal_gap <= gap_limit:
+                    has_inline_text_neighbor = True
+                    break
+        key = (number, label_kind, has_inline_text_neighbor)
         if key in seen:
             continue
         seen.add(key)
-        observations.append(PageLabelObservation(page_index, number, label_kind, str(word["text"])))
+        observations.append(
+            PageLabelObservation(
+                page_index,
+                number,
+                label_kind,
+                str(word["text"]),
+                float(word["top"]),
+                float(word["bottom"]),
+                x0,
+                x1,
+                width,
+                height,
+                has_inline_text_neighbor,
+            )
+        )
     return observations
 
 
@@ -428,12 +1118,55 @@ def detect_toc_pages(
             if page_index in explicit_pages:
                 toc_pages.add(page_index)
             continue
-        has_heading = any(heading in analysis.normalized_text for heading in TOC_HEADINGS)
-        if (has_heading and len(rows) >= 2) or len(rows) >= 6:
+        has_heading = has_toc_heading_line(analysis)
+        if has_heading and len(rows) >= 2:
             toc_pages.add(page_index)
     if explicit_pages is None:
-        toc_pages = expand_continuation_toc_pages(analyses, toc_pages)
+        toc_pages = expand_continuation_toc_pages(
+            analyses,
+            toc_pages,
+            rows_by_page,
+        )
     return toc_pages, rows_by_page
+
+
+def headingless_navigation_candidates(
+    analyses: Sequence[PageAnalysis],
+    toc_pages: set[int],
+    rows_by_page: Mapping[int, Sequence[TocRow]],
+) -> list[int]:
+    """Return strong isolated navigation layouts that must not pass silently."""
+
+    candidates: list[int] = []
+    for analysis in analyses:
+        rows = rows_by_page.get(analysis.page_index, ())
+        readable_lines = sum(
+            bool(normalize_text(" ".join(str(word["text"]) for word in line)))
+            for line in analysis.lines
+        )
+        row_density = len(rows) / max(1, readable_lines)
+        if (
+            analysis.page_index not in toc_pages
+            and len(rows) >= 6
+            and row_density >= 0.35
+        ):
+            candidates.append(analysis.page_index)
+    return sorted(candidates)
+
+
+def navigation_rows_without_internal_links(
+    toc_pages: set[int],
+    rows_by_page: Mapping[int, Sequence[TocRow]],
+    existing_counts: Mapping[str, int],
+    added: Sequence[AddedLink],
+) -> bool:
+    """Return whether detected navigation produced no page-jump annotations."""
+
+    navigation_rows_expected = any(rows_by_page.get(page) for page in toc_pages)
+    final_internal_links = int(existing_counts.get("internal", 0)) + sum(
+        link.kind == "internal" for link in added
+    )
+    return navigation_rows_expected and final_internal_links == 0
 
 
 def contiguous_groups(pages: Iterable[int]) -> list[tuple[int, int]]:
@@ -451,6 +1184,35 @@ def contiguous_groups(pages: Iterable[int]) -> list[tuple[int, int]]:
     return groups
 
 
+def eligible_margin_observation(observation: PageLabelObservation) -> bool:
+    """Return whether an edge number may support or contradict pagination."""
+
+    if observation.has_inline_text_neighbor:
+        return False
+    if (
+        observation.top is None
+        or observation.x0 is None
+        or observation.x1 is None
+        or observation.page_width is None
+        or observation.page_height is None
+    ):
+        return True
+    center = (observation.x0 + observation.x1) / 2
+    centered = (
+        abs(center - observation.page_width / 2)
+        <= observation.page_width * 0.14
+    )
+    in_outer_corner = (
+        observation.x0 <= observation.page_width * 0.22
+        or observation.x1 >= observation.page_width * 0.78
+    )
+    at_page_edge = (
+        observation.top <= observation.page_height * 0.08
+        or observation.top >= observation.page_height * 0.88
+    )
+    return (centered or in_outer_corner) and at_page_edge
+
+
 def infer_pagination_segments(
     analyses: Sequence[PageAnalysis], toc_pages: set[int]
 ) -> tuple[list[PaginationSegment], list[dict]]:
@@ -465,6 +1227,7 @@ def infer_pagination_segments(
             observation
             for analysis in analyses[region_start : region_end + 1]
             for observation in analysis.margin_labels
+            if eligible_margin_observation(observation)
         ]
         for label_kind in ("roman", "arabic"):
             by_offset: dict[int, dict[int, PageLabelObservation]] = defaultdict(dict)
@@ -518,6 +1281,22 @@ def infer_pagination_segments(
                 "margin_observations": len(observations),
             }
         )
+    support_by_group: dict[tuple[int, str], int] = defaultdict(int)
+    for segment in segments:
+        key = (segment.block_index, segment.label_kind)
+        support_by_group[key] = max(support_by_group[key], segment.evidence_pages)
+    segments = [
+        segment
+        for segment in segments
+        if segment.evidence_pages >= 8
+        or segment.evidence_pages
+        >= max(
+            2,
+            math.ceil(
+                support_by_group[(segment.block_index, segment.label_kind)] * 0.04
+            ),
+        )
+    ]
     segments.sort(
         key=lambda item: (item.block_index, item.label_kind, item.printed_start, item.offset)
     )
@@ -569,6 +1348,48 @@ def unique_title_destination(
     return scores[0][1], scores[0][0]
 
 
+def toc_title_variants(title: str, ordinal: int | None = None) -> list[str]:
+    """Return the full title plus only the fragment owned by this row ordinal."""
+
+    variants = [str(title).strip()]
+    if ordinal is None:
+        return variants
+    matches = list(re.finditer(r"(?<!\w)([0-9]{1,3})[.·):]+\s*", str(title)))
+    for index, match in enumerate(matches):
+        if int(match.group(1)) != ordinal:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(title)
+        fragment = str(title)[match.start() : end].strip(" .·•-–—\t")
+        without_ordinal = str(title)[match.end() : end].strip(" .·•-–—\t")
+        for candidate in (fragment, without_ordinal):
+            if len(normalize_text(candidate)) >= 5 and candidate not in variants:
+                variants.append(candidate)
+    return variants
+
+
+def page_has_chapter_heading(normalized_page: str, ordinal: int | None) -> bool:
+    """Confirm a chapter/section ordinal from an explicit destination heading."""
+
+    if ordinal is None or ordinal <= 0:
+        return False
+    labels = {str(ordinal), int_to_roman(ordinal).lower()}
+    if any(
+        re.search(rf"\b(?:chapter|section)\s+{re.escape(label)}\b", normalized_page)
+        for label in labels
+    ):
+        return True
+    for match in re.finditer(
+        r"\b(?:chapter|section)\s+([a-z0-9]{1,10})\b",
+        normalized_page,
+    ):
+        token = match.group(1)
+        candidates = {number for number, _ in page_label_candidates(token)}
+        parsed_ordinal = _toc_ordinal(token)
+        if ordinal in candidates or parsed_ordinal == ordinal:
+            return True
+    return False
+
+
 def likely_toc_line_count(analysis: PageAnalysis) -> int:
     count = 0
     for line in analysis.lines:
@@ -578,22 +1399,15 @@ def likely_toc_line_count(analysis: PageAnalysis) -> int:
         if len(title) < 3 or title in TOC_HEADINGS:
             continue
         raw_label = str(line[-1]["text"])
-        compact = re.sub(r"[^A-Za-z]", "", raw_label)
-        roman_like = (
-            0 < len(compact) <= 6
-            and sum(char.upper() in "IVXLCDM" for char in compact) >= len(compact) - 1
-        )
-        if (
-            parse_page_label_details(raw_label) is not None
-            or any(char.isdigit() for char in raw_label)
-            or roman_like
-        ):
+        if page_label_candidates(raw_label) or page_range_candidates(raw_label):
             count += 1
     return count
 
 
 def expand_continuation_toc_pages(
-    analyses: Sequence[PageAnalysis], toc_pages: set[int]
+    analyses: Sequence[PageAnalysis],
+    toc_pages: set[int],
+    rows_by_page: Mapping[int, Sequence[TocRow]],
 ) -> set[int]:
     expanded = set(toc_pages)
     changed = True
@@ -603,7 +1417,7 @@ def expand_continuation_toc_pages(
             if page_index in expanded:
                 continue
             adjacent = page_index - 1 in expanded or page_index + 1 in expanded
-            if adjacent and max(likely_toc_line_count(analysis), analysis.ordinal_anchor_count) >= 5:
+            if adjacent and len(rows_by_page.get(page_index, ())) >= 5:
                 expanded.add(page_index)
                 changed = True
     return expanded
@@ -613,14 +1427,26 @@ def toc_completeness_diagnostics(
     analyses: Sequence[PageAnalysis],
     toc_pages: set[int],
     rows_by_page: dict[int, list[TocRow]],
+    minimum_expected_by_page: Mapping[int, int] | None = None,
 ) -> tuple[list[dict], int]:
     diagnostics: list[dict] = []
     suspected_total = 0
-    for page_index in sorted(toc_pages):
+    diagnostic_pages = set(toc_pages) | set((minimum_expected_by_page or {}).keys())
+    for page_index in sorted(diagnostic_pages):
         analysis = analyses[page_index]
         parsed = len(rows_by_page.get(page_index, []))
         candidate_lines = likely_toc_line_count(analysis)
-        expected = max(parsed, candidate_lines, analysis.ordinal_anchor_count)
+        navigation_layout = any(
+            bool(word.get("ocr_navigation")) for word in analysis.words
+        )
+        prior_expected = int((minimum_expected_by_page or {}).get(page_index, 0))
+        expected = max(parsed, prior_expected)
+        if not navigation_layout:
+            expected = max(
+                expected,
+                candidate_lines,
+                analysis.ordinal_anchor_count,
+            )
         suspected = max(0, expected - parsed)
         suspected_total += suspected
         diagnostics.append(
@@ -629,6 +1455,8 @@ def toc_completeness_diagnostics(
                 "parsed_rows": parsed,
                 "candidate_lines": candidate_lines,
                 "ordinal_anchors": analysis.ordinal_anchor_count,
+                "minimum_expected_rows": prior_expected,
+                "expected_rows": expected,
                 "suspected_unparsed_rows": suspected,
             }
         )
@@ -661,14 +1489,198 @@ def trusted_margin_numbers(
         for segment in segments
         if segment.block_index == block_index and segment.label_kind == label_kind
     }
+    trusted: set[int] = set()
+    for observation in analysis.margin_labels:
+        if not eligible_margin_observation(observation):
+            continue
+        candidates = page_label_candidates(observation.raw)
+        if not candidates:
+            candidates = [(observation.printed_number, observation.label_kind)]
+        for printed_number, candidate_kind in candidates:
+            if (
+                candidate_kind == label_kind
+                and (analysis.page_index + 1) - printed_number in offsets
+            ):
+                trusted.add(printed_number)
+    return sorted(trusted)
+
+
+def visible_margin_numbers(analysis: PageAnalysis, label_kind: str) -> list[int]:
+    """Return visible edge labels credible enough to prove a conflict.
+
+    ``margin_label_observations`` already limits candidates to the outer page
+    bands and to conventional centred or outside-corner positions.  Keep the
+    same bounds here so a real label cannot disappear in the narrow gap
+    between pagination inference and destination validation.
+    """
+
     return sorted(
         {
             observation.printed_number
             for observation in analysis.margin_labels
             if observation.label_kind == label_kind
-            and (analysis.page_index + 1) - observation.printed_number in offsets
+            and eligible_margin_observation(observation)
         }
     )
+
+
+def locally_supported_margin_numbers(
+    analyses: Sequence[PageAnalysis],
+    page_index: int,
+    label_kind: str,
+    expected_number: int | None = None,
+) -> list[int]:
+    """Keep conflicts unless neighbours positively support the expected label.
+
+    Scanned books sometimes expose a selectable text layer whose digit glyphs
+    decode incorrectly (for example, a visible ``184`` may extract as ``114``).
+    Ignore such an outlier only when nearby pages form the expected sequence.
+    An unrelated neighbour must never make visible conflict evidence disappear.
+    """
+
+    observed = visible_margin_numbers(analyses[page_index], label_kind)
+    neighbours: list[tuple[int, int]] = []
+    for neighbour_index in range(
+        max(0, page_index - 2),
+        min(len(analyses), page_index + 3),
+    ):
+        if neighbour_index == page_index:
+            continue
+        neighbours.extend(
+            (neighbour_index, number)
+            for number in visible_margin_numbers(
+                analyses[neighbour_index],
+                label_kind,
+            )
+        )
+    expected_sequence_support = {
+        neighbour_index
+        for neighbour_index, neighbour_number in neighbours
+        if expected_number is not None
+        and neighbour_index - page_index == neighbour_number - expected_number
+    }
+    expected_sequence_supported = len(expected_sequence_support) >= 2
+    return sorted(
+        number
+        for number in observed
+        if (
+            any(
+                neighbour_index - page_index == neighbour_number - number
+                for neighbour_index, neighbour_number in neighbours
+            )
+            or not expected_sequence_supported
+        )
+    )
+
+
+def _bottom_center_digit_observations(
+    analysis: PageAnalysis,
+) -> list[PageLabelObservation]:
+    observations: list[PageLabelObservation] = []
+    for observation in analysis.margin_labels:
+        if (
+            observation.label_kind != "arabic"
+            or observation.top is None
+            or observation.x0 is None
+            or observation.x1 is None
+            or observation.page_width is None
+            or observation.page_height is None
+            or not re.fullmatch(r"[0-9]+", observation.raw.strip())
+        ):
+            continue
+        center = (observation.x0 + observation.x1) / 2
+        if (
+            observation.top >= observation.page_height * 0.88
+            and abs(center - observation.page_width / 2)
+            <= observation.page_width * 0.14
+        ):
+            observations.append(observation)
+    return observations
+
+
+def _single_digit_substitution(
+    expected_number: int, observed_text: str
+) -> tuple[int, str, str] | None:
+    expected_text = str(expected_number)
+    observed_text = observed_text.strip()
+    if len(expected_text) != len(observed_text) or not observed_text.isdigit():
+        return None
+    differences = [
+        index
+        for index, (expected, observed) in enumerate(
+            zip(expected_text, observed_text, strict=True)
+        )
+        if expected != observed
+    ]
+    if len(differences) != 1:
+        return None
+    index = differences[0]
+    substitution = (index, expected_text[index], observed_text[index])
+    if substitution[1:] not in {("7", "1"), ("1", "7")}:
+        return None
+    return substitution
+
+
+def corroborated_footer_ocr_substitution(
+    analyses: Sequence[PageAnalysis],
+    page_index: int,
+    expected_number: int,
+    conflicting_number: int,
+) -> dict | None:
+    """Confirm a repeated 7/1 glyph-decoding error in centred footers."""
+
+    current_observations = _bottom_center_digit_observations(analyses[page_index])
+    for current in current_observations:
+        if current.printed_number != conflicting_number:
+            continue
+        substitution = _single_digit_substitution(expected_number, current.raw)
+        if substitution is None:
+            continue
+        position, expected_digit, observed_digit = substitution
+        for page_delta in (-1, 1):
+            neighbour_index = page_index + page_delta
+            neighbour_expected = expected_number + page_delta
+            if not (0 <= neighbour_index < len(analyses)) or neighbour_expected <= 0:
+                continue
+            for neighbour in _bottom_center_digit_observations(
+                analyses[neighbour_index]
+            ):
+                neighbour_substitution = _single_digit_substitution(
+                    neighbour_expected, neighbour.raw
+                )
+                if neighbour_substitution != substitution:
+                    continue
+                assert current.page_width is not None
+                assert current.page_height is not None
+                assert current.x0 is not None and current.x1 is not None
+                assert current.top is not None
+                assert neighbour.page_width is not None
+                assert neighbour.page_height is not None
+                assert neighbour.x0 is not None and neighbour.x1 is not None
+                assert neighbour.top is not None
+                current_center_ratio = (
+                    (current.x0 + current.x1) / 2 / current.page_width
+                )
+                neighbour_center_ratio = (
+                    (neighbour.x0 + neighbour.x1) / 2 / neighbour.page_width
+                )
+                current_top_ratio = current.top / current.page_height
+                neighbour_top_ratio = neighbour.top / neighbour.page_height
+                if (
+                    abs(current_center_ratio - neighbour_center_ratio) > 0.03
+                    or abs(current_top_ratio - neighbour_top_ratio) > 0.03
+                ):
+                    continue
+                return {
+                    "expected": expected_number,
+                    "observed": int(current.raw.strip()),
+                    "neighbor_expected": neighbour_expected,
+                    "neighbor_observed": int(neighbour.raw.strip()),
+                    "neighbor_page": neighbour_index + 1,
+                    "substitution": f"{expected_digit}->{observed_digit}",
+                    "digit_position": position,
+                }
+    return None
 
 
 def resolve_toc_row(
@@ -681,29 +1693,131 @@ def resolve_toc_row(
     toc_pages: set[int],
 ) -> tuple[int | None, str | None, str, dict]:
     page_count = len(analyses)
-    candidates: list[tuple[PaginationSegment, int]] = []
+    allowed_content_pages = block_content_pages(block_index, blocks, page_count)
+    candidates: list[tuple[PaginationSegment, int, bool]] = []
     for segment in segments:
         if (
             segment.block_index == block_index
             and segment.label_kind == row.label_kind
-            and segment.printed_start - 4 <= row.printed_number <= segment.printed_end + 4
         ):
             destination = row.printed_number + segment.offset - 1
-            if 0 <= destination < page_count:
-                candidates.append((segment, destination))
+            if 0 <= destination < page_count and destination in allowed_content_pages:
+                near_segment = (
+                    segment.printed_start - 4
+                    <= row.printed_number
+                    <= segment.printed_end + 4
+                )
+                candidates.append((segment, destination, near_segment))
 
-    scored: list[tuple[float, bool, bool, PaginationSegment, int, list[int]]] = []
-    for segment, destination in candidates:
-        observed = trusted_margin_numbers(
+    scored: list[
+        tuple[
+            float,
+            bool,
+            bool,
+            PaginationSegment,
+            int,
+            list[int],
+            bool,
+            float,
+            bool,
+            dict | None,
+        ]
+    ] = []
+    for segment, destination, near_segment in candidates:
+        trusted_observed = trusted_margin_numbers(
             analyses[destination], block_index, row.label_kind, segments
         )
-        exact_label = row.printed_number in observed
-        conflicting_label = bool(observed) and not exact_label
-        title_score = title_match_score(row.title, normalized_pages[destination])
+        observed = visible_margin_numbers(analyses[destination], row.label_kind)
+        exact_label = row.printed_number in trusted_observed
+        supported_observed = locally_supported_margin_numbers(
+            analyses,
+            destination,
+            row.label_kind,
+            row.printed_number,
+        )
+        conflicting_numbers = [
+            number
+            for number in observed
+            if number in supported_observed
+            or abs(number - row.printed_number) <= 1
+        ]
+        conflicting_label = bool(conflicting_numbers) and not exact_label
+        title_variants = toc_title_variants(row.title, row.ordinal)
+        variant_scores = [
+            (title_match_score(variant, normalized_pages[destination]), variant)
+            for variant in title_variants
+        ]
+        title_score, _ = max(variant_scores, default=(0.0, row.title))
+        ordinal_heading_match = page_has_chapter_heading(
+            normalized_pages[destination], row.ordinal
+        )
+        one_page_label_override = False
+        footer_ocr_substitution_override: dict | None = None
+        if (
+            conflicting_label
+            and len(conflicting_numbers) == 1
+            and abs(conflicting_numbers[0] - row.printed_number) == 1
+            and (title_score >= 0.9 or ordinal_heading_match)
+        ):
+            if ordinal_heading_match:
+                conflicting_label = False
+                one_page_label_override = True
+                title_score = max(title_score, 0.95)
+            else:
+                for candidate_score, title_variant in sorted(
+                    variant_scores, reverse=True
+                ):
+                    if candidate_score < 0.9:
+                        continue
+                    unique_destination, unique_score = unique_title_destination(
+                        title_variant,
+                        normalized_pages,
+                        toc_pages,
+                        allowed_pages=allowed_content_pages,
+                    )
+                    if unique_destination == destination and unique_score >= 0.95:
+                        conflicting_label = False
+                        one_page_label_override = True
+                        break
+        if (
+            conflicting_label
+            and near_segment
+            and segment.evidence_pages >= 8
+            and ordinal_heading_match
+            and title_score >= 0.6
+            and len(conflicting_numbers) == 1
+        ):
+            footer_ocr_substitution_override = corroborated_footer_ocr_substitution(
+                analyses,
+                destination,
+                row.printed_number,
+                conflicting_numbers[0],
+            )
+            if footer_ocr_substitution_override is not None:
+                conflicting_label = False
+                title_score = max(title_score, 0.95)
         score = (2.0 if exact_label else 0.0) + title_score + min(0.5, segment.evidence_pages / 20)
-        scored.append((score, exact_label, conflicting_label, segment, destination, observed))
+        scored.append(
+            (
+                score,
+                exact_label,
+                conflicting_label,
+                segment,
+                destination,
+                observed,
+                near_segment,
+                title_score,
+                one_page_label_override,
+                footer_ocr_substitution_override,
+            )
+        )
     scored.sort(key=lambda item: (-item[0], -item[3].evidence_pages, item[4]))
-    viable = [item for item in scored if not item[2]]
+    viable = [
+        item
+        for item in scored
+        if not item[2]
+        and (item[6] or (item[1] and item[7] == 1.0))
+    ]
     if viable:
         chosen = viable[0]
         if len(viable) > 1 and abs(viable[0][0] - viable[1][0]) < 0.25:
@@ -711,8 +1825,19 @@ def resolve_toc_row(
                 "reason": "multiple pagination segments map this label",
                 "candidate_target_pages": [item[4] + 1 for item in viable],
             }
-        _, exact_label, _, segment, destination, observed = chosen
-        confidence = "high" if exact_label or title_match_score(row.title, normalized_pages[destination]) >= 0.9 else "medium"
+        (
+            _,
+            exact_label,
+            _,
+            segment,
+            destination,
+            observed,
+            _,
+            title_score,
+            one_page_label_override,
+            footer_ocr_substitution_override,
+        ) = chosen
+        confidence = "high" if exact_label or title_score >= 0.9 else "medium"
         return destination, "pagination-segment", confidence, {
             "block_index": block_index,
             "offset": segment.offset,
@@ -722,7 +1847,13 @@ def resolve_toc_row(
                 segment.printed_start <= row.printed_number <= segment.printed_end
             ),
             "target_margin_labels": observed,
-            "target_title_score": round(title_match_score(row.title, normalized_pages[destination]), 4),
+            "target_title_score": round(title_score, 4),
+            "one_page_label_override": one_page_label_override,
+            "footer_ocr_substitution_override": footer_ocr_substitution_override,
+            "row_ordinal": row.ordinal,
+            "ordinal_heading_match": page_has_chapter_heading(
+                normalized_pages[destination], row.ordinal
+            ),
         }
     if scored:
         return None, None, "low", {
@@ -731,14 +1862,14 @@ def resolve_toc_row(
             "observed_labels": [item[5] for item in scored],
         }
 
-    allowed_pages = block_content_pages(block_index, blocks, page_count)
     destination, score = unique_title_destination(
-        row.title, normalized_pages, toc_pages, allowed_pages=allowed_pages
+        row.title,
+        normalized_pages,
+        toc_pages,
+        allowed_pages=allowed_content_pages,
     )
     if destination is not None:
-        observed = trusted_margin_numbers(
-            analyses[destination], block_index, row.label_kind, segments
-        )
+        observed = visible_margin_numbers(analyses[destination], row.label_kind)
         if observed and row.printed_number not in observed:
             return None, None, "low", {
                 "reason": "title match conflicts with destination page label",
@@ -752,6 +1883,133 @@ def resolve_toc_row(
             "target_title_score": round(score, 4),
         }
     return None, None, "low", {"reason": "no safe pagination or unique title match"}
+
+
+def canonicalize_toc_rows(
+    rows_by_page: dict[int, list[TocRow]],
+    toc_pages: set[int],
+    blocks: Sequence[tuple[int, int]],
+    segments: Sequence[PaginationSegment],
+    analyses: Sequence[PageAnalysis],
+    normalized_pages: Sequence[str],
+) -> dict[int, list[TocRow]]:
+    """Choose OCR label candidates using destination and neighbour evidence."""
+
+    canonical = {page: list(rows) for page, rows in rows_by_page.items()}
+    for block_index, (block_start, block_end) in enumerate(blocks):
+        ordered: list[tuple[int, int, TocRow]] = []
+        for page_index in range(block_start, block_end + 1):
+            ordered.extend(
+                (page_index, row_index, row)
+                for row_index, row in enumerate(canonical.get(page_index, ()))
+            )
+
+        previous_by_kind: dict[str, int] = {}
+        for position, (page_index, row_index, row) in enumerate(ordered):
+            options = list(row.label_candidates) or [(row.printed_number, row.label_kind)]
+            rotated_candidate = (
+                rotated_page_label_candidate(row.printed_label)
+                if row.navigation_ocr
+                else None
+            )
+            if (
+                rotated_candidate is not None
+                and (rotated_candidate, "arabic") not in options
+            ):
+                options.append((rotated_candidate, "arabic"))
+            options = list(dict.fromkeys(options))
+            evaluated: list[tuple[float, int, str, int | None, dict]] = []
+            for number, kind in options:
+                if number <= 0:
+                    continue
+                previous = previous_by_kind.get(kind)
+                if previous is not None and number < previous:
+                    continue
+
+                following_numbers = [
+                    candidate_number
+                    for _, _, following_row in ordered[position + 1 : position + 4]
+                    for candidate_number, candidate_kind in (
+                        list(following_row.label_candidates)
+                        or [(following_row.printed_number, following_row.label_kind)]
+                    )
+                    if candidate_kind == kind
+                ]
+                if following_numbers and max(following_numbers) < number:
+                    continue
+
+                candidate_row = replace(
+                    row,
+                    printed_number=number,
+                    label_kind=kind,
+                    label_candidates=(),
+                )
+                destination, _, confidence, evidence = resolve_toc_row(
+                    candidate_row,
+                    block_index,
+                    blocks,
+                    segments,
+                    analyses,
+                    normalized_pages,
+                    toc_pages,
+                )
+                is_primary_candidate = (number, kind) == (
+                    row.printed_number,
+                    row.label_kind,
+                )
+                if (
+                    not is_primary_candidate
+                    and destination is not None
+                    and number not in evidence.get("target_margin_labels", [])
+                ):
+                    destination = None
+                score = 0.0
+                if destination is not None:
+                    score += 100.0
+                    score += 20.0 if confidence == "high" else 8.0
+                    if number in evidence.get("target_margin_labels", []):
+                        score += 20.0
+                    score += float(evidence.get("target_title_score", 0.0)) * 12.0
+                else:
+                    if any(
+                        segment.block_index == block_index
+                        and segment.label_kind == kind
+                        and 0 <= number + segment.offset - 1 < len(analyses)
+                        for segment in segments
+                    ):
+                        score += 2.0
+                if (number, kind) == (row.printed_number, row.label_kind):
+                    score += 0.25
+                evaluated.append((score, number, kind, destination, evidence))
+
+            if not evaluated:
+                continue
+            primary_resolved = any(
+                number == row.printed_number
+                and kind == row.label_kind
+                and destination is not None
+                for _, number, kind, destination, _ in evaluated
+            )
+            if primary_resolved and rotated_candidate is not None:
+                evaluated = [
+                    item
+                    for item in evaluated
+                    if not (
+                        item[1] == rotated_candidate
+                        and item[2] == "arabic"
+                        and item[1] != row.printed_number
+                    )
+                ]
+            evaluated.sort(key=lambda item: (-item[0], item[1], item[2]))
+            _, number, kind, _, _ = evaluated[0]
+            canonical_row = replace(
+                row,
+                printed_number=number,
+                label_kind=kind,
+            )
+            canonical[page_index][row_index] = canonical_row
+            previous_by_kind[kind] = number
+    return canonical
 
 
 def rect_overlap_ratio(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1621,6 +2879,8 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     warnings: list[str] = []
     review_reasons: list[str] = []
     toc_pages: set[int] = set()
+    rows_by_page: dict[int, list[TocRow]] = {}
+    headingless_navigation_pages: list[int] = []
     detected_offset: int | None = None
     offset_score = 0
     mode = "automatic-analysis"
@@ -1632,6 +2892,8 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     parsed_toc_rows = 0
     covered_existing_rows = 0
     ocr_summary: OCRSummary | None = None
+    navigation_ocr_summary: NavigationOCRSummary | None = None
+    preliminary_expected_by_page: dict[int, int] = {}
     covered_replay_links: list[AddedLink] = []
     replay_conflicts: list[dict] = []
     rotated_automatic_url_pages: set[int] = set()
@@ -1756,6 +3018,75 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 replace_analysis_words(analyses[page_index], ocr_words, page_count)
             explicit_toc_pages = parse_page_list(args.toc_pages, page_count)
             toc_pages, rows_by_page = detect_toc_pages(analyses, explicit_toc_pages)
+            preliminary_completeness, _ = toc_completeness_diagnostics(
+                analyses, toc_pages, rows_by_page
+            )
+            preliminary_expected_by_page = {
+                int(item["page"]) - 1: int(item["expected_rows"])
+                for item in preliminary_completeness
+            }
+            full_page_ocr_enriched = set(ocr_summary.enriched_pages)
+            navigation_ocr_pages = [
+                int(item["page"]) - 1
+                for item in preliminary_completeness
+                if analyses[int(item["page"]) - 1].image_area_ratio >= 0.55
+                and (
+                    int(item["suspected_unparsed_rows"]) > 0
+                    or (
+                        int(item["parsed_rows"]) >= 8
+                        and int(item["page"]) not in full_page_ocr_enriched
+                        and not has_section_range_layout(
+                            analyses[int(item["page"]) - 1].words
+                        )
+                    )
+                )
+            ]
+            if navigation_ocr_pages and not args.no_toc_links:
+                emit_progress(
+                    "OCR_PAGES",
+                    completed=0,
+                    total=len(navigation_ocr_pages),
+                    unit="page",
+                    message=(
+                        f"Rechecking the page-number column on "
+                        f"{len(navigation_ocr_pages)} contents pages"
+                    ),
+                    counts={"navigation_pages": len(navigation_ocr_pages)},
+                )
+                navigation_words, navigation_ocr_summary = ocr_navigation_columns(
+                    input_path,
+                    analyses,
+                    navigation_ocr_pages,
+                    password=args.password,
+                    rotations=rotations,
+                )
+                for page_index, label_words in navigation_words.items():
+                    replace_analysis_words(
+                        analyses[page_index],
+                        [*analyses[page_index].words, *label_words],
+                        page_count,
+                    )
+                emit_progress(
+                    "OCR_PAGES",
+                    completed=len(navigation_ocr_pages),
+                    total=len(navigation_ocr_pages),
+                    unit="page",
+                    message="Finished rechecking contents page numbers",
+                    counts={
+                        "navigation_pages": len(navigation_ocr_pages),
+                        "navigation_pages_with_words": len(
+                            navigation_ocr_summary.pages_with_words
+                        ),
+                    },
+                )
+            toc_pages, rows_by_page = detect_toc_pages(
+                analyses, explicit_toc_pages
+            )
+            headingless_navigation_pages = headingless_navigation_candidates(
+                analyses,
+                toc_pages,
+                rows_by_page,
+            )
             pagination_segments, pagination_diagnostics = infer_pagination_segments(
                 analyses, toc_pages
             )
@@ -1791,6 +3122,19 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 (segment.evidence_pages for segment in pagination_segments), default=0
             )
             normalized_pages = [analysis.normalized_text for analysis in analyses]
+            rows_by_page = canonicalize_toc_rows(
+                rows_by_page,
+                toc_pages,
+                blocks,
+                pagination_segments,
+                analyses,
+                normalized_pages,
+            )
+            headingless_navigation_pages = headingless_navigation_candidates(
+                analyses,
+                toc_pages,
+                rows_by_page,
+            )
             if not toc_pages and not args.no_toc_links:
                 # A contents page converted to outlines or a page-sized image has no
                 # readable words. Inspect only likely front matter so ordinary image
@@ -1817,7 +3161,10 @@ def _make_interactive(args: argparse.Namespace) -> dict:
 
             parsed_toc_rows = sum(len(rows_by_page[page]) for page in toc_pages)
             completeness_diagnostics, suspected_unparsed_rows = toc_completeness_diagnostics(
-                analyses, toc_pages, rows_by_page
+                analyses,
+                toc_pages,
+                rows_by_page,
+                preliminary_expected_by_page,
             )
 
             if not any(text.strip() for text in normalized_pages):
@@ -1830,6 +3177,20 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 message = (
                     f"The text layer suggests at least {suspected_unparsed_rows} TOC rows whose "
                     "page labels were not parsed. Use targeted OCR or a reviewed link manifest."
+                )
+                warnings.append(message)
+                review_reasons.append(message)
+            if (
+                headingless_navigation_pages
+                and explicit_toc_pages is None
+                and not args.no_toc_links
+            ):
+                displayed_pages = ", ".join(
+                    str(page_index + 1) for page_index in headingless_navigation_pages
+                )
+                message = (
+                    f"Pages {displayed_pages} look like navigation lists but have no clear "
+                    "heading. Select those pages explicitly before adding page jumps."
                 )
                 warnings.append(message)
                 review_reasons.append(message)
@@ -1873,9 +3234,11 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                             unresolved.append(
                                 {
                                     "source_page": source_page + 1,
-                                    "title": row.title,
-                                    "printed_label": row.printed_label,
-                                    "label_kind": row.label_kind,
+                            "title": row.title,
+                            "printed_label": row.printed_label,
+                            "canonical_printed_number": row.printed_number,
+                            "row_ordinal": row.ordinal,
+                            "label_kind": row.label_kind,
                                     "reason": evidence.get("reason", "no safe destination"),
                                     "evidence": evidence,
                                 }
@@ -1889,9 +3252,11 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                                 unresolved.append(
                                     {
                                         "source_page": source_page + 1,
-                                        "title": row.title,
-                                        "printed_label": row.printed_label,
-                                        "label_kind": row.label_kind,
+                                "title": row.title,
+                                "printed_label": row.printed_label,
+                                "canonical_printed_number": row.printed_number,
+                                "row_ordinal": row.ordinal,
+                                "label_kind": row.label_kind,
                                         "reason": "an overlapping existing link has a different or unknown destination",
                                         "evidence": {"expected_target_page": destination + 1, "existing_targets": [value + 1 for value in targets]},
                                     }
@@ -1948,11 +3313,21 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             added.append(link)
             occupied[link.source_page].append(link.rect)
 
-    if ocr_summary is not None and ocr_summary.failed_pages:
-        pages = ", ".join(str(page) for page in ocr_summary.failed_pages)
-        message = f"Local OCR could not complete on page(s): {pages}."
-        warnings.append(message)
-        review_reasons.append(message)
+        if ocr_summary is not None and ocr_summary.failed_pages:
+            pages = ", ".join(str(page) for page in ocr_summary.failed_pages)
+            message = f"Local OCR could not complete on page(s): {pages}."
+            warnings.append(message)
+            review_reasons.append(message)
+        if navigation_ocr_summary is not None and navigation_ocr_summary.failed_pages:
+            pages = ", ".join(
+                str(page) for page in navigation_ocr_summary.failed_pages
+            )
+            message = (
+                "Page-number column OCR could not complete on page(s): "
+                f"{pages}."
+            )
+            warnings.append(message)
+            review_reasons.append(message)
 
     invalid_external_links = [
         link for link in added if link.kind == "external" and not supported_uri(str(link.uri))
@@ -2000,8 +3375,33 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         )
         warnings.append(message)
         review_reasons.append(message)
+    ambiguous_unresolved_labels = [
+        item
+        for item in unresolved
+        if parse_page_label_details(str(item.get("printed_label", ""))) is None
+        and page_label_candidates(str(item.get("printed_label", "")))
+    ]
+    if ambiguous_unresolved_labels:
+        suspected_unparsed_rows = max(
+            suspected_unparsed_rows,
+            len(ambiguous_unresolved_labels),
+        )
     if unresolved:
         message = f"{len(unresolved)} detected TOC rows could not be safely mapped."
+        warnings.append(message)
+        review_reasons.append(message)
+    if (
+        not args.no_toc_links
+        and navigation_rows_without_internal_links(
+            toc_pages,
+            rows_by_page,
+            existing_counts,
+            added,
+        )
+    ):
+        message = (
+            "Navigation rows were detected, but no internal page links were retained."
+        )
         warnings.append(message)
         review_reasons.append(message)
     if not added and not existing_counts["internal"] and not existing_counts["external"]:
@@ -2036,8 +3436,17 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         "mode": mode,
         "ocr": (
             {
-                "used": bool(ocr_summary.attempted_pages),
+                "used": bool(ocr_summary.attempted_pages)
+                or bool(
+                    navigation_ocr_summary
+                    and navigation_ocr_summary.attempted_pages
+                ),
                 **ocr_summary.as_report(),
+                "navigation_recheck": (
+                    navigation_ocr_summary.as_report()
+                    if navigation_ocr_summary is not None
+                    else {"attempted_pages": []}
+                ),
             }
             if ocr_summary is not None
             else {"used": False}

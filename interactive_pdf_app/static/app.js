@@ -81,6 +81,9 @@
     file: null,
     jobId: null,
     pollSequence: 0,
+    activePollSequence: null,
+    pollWakeResolvers: new Set(),
+    pollingFinished: false,
     lastPayload: null,
     uploadController: null,
     requestControllers: new Set(),
@@ -331,13 +334,7 @@
         return;
       }
       showView(elements.processingView);
-      const sequence = ++state.pollSequence;
-      void pollJob(sequence).catch((error) => {
-        if (error?.name === "AbortError" || sequence !== state.pollSequence) {
-          return;
-        }
-        showFailure(friendlyError(error));
-      });
+      resumeActiveJobPolling();
       return;
     }
 
@@ -799,6 +796,7 @@
     state.uploadController = uploadController;
     state.jobId = null;
     state.lastPayload = null;
+    state.pollingFinished = false;
     elements.startButton.disabled = true;
     elements.startButton.textContent = "Starting...";
     resetProgress();
@@ -853,40 +851,112 @@
     }
   }
 
-  async function pollJob(sequence) {
-    while (sequence === state.pollSequence && state.jobId) {
-      let response;
-      try {
-        response = await apiFetch(`/api/jobs/${encodeURIComponent(state.jobId)}`);
-      } catch (error) {
-        if (error?.name === "AbortError" || sequence !== state.pollSequence) {
+  function wakeJobPolling() {
+    const resolvers = Array.from(state.pollWakeResolvers);
+    state.pollWakeResolvers.clear();
+    resolvers.forEach((resolve) => resolve());
+  }
+
+  function waitForPollingOpportunity(milliseconds = 0) {
+    return new Promise((resolve) => {
+      let timer = null;
+      let settled = false;
+      const finish = () => {
+        if (settled) {
           return;
         }
-        if (isNetworkFailure(error) && !state.appClosed) {
-          await delay(POLL_DELAY_MS);
+        settled = true;
+        state.pollWakeResolvers.delete(finish);
+        if (timer !== null) {
+          window.clearTimeout(timer);
+        }
+        resolve();
+      };
+
+      state.pollWakeResolvers.add(finish);
+      if (!document.hidden) {
+        timer = window.setTimeout(finish, milliseconds);
+      }
+    });
+  }
+
+  function resumeActiveJobPolling() {
+    if (
+      !state.jobId ||
+      document.hidden ||
+      state.appClosed ||
+      state.connectionUnavailable ||
+      state.pollingFinished
+    ) {
+      return;
+    }
+
+    // Wake the existing loop instead of starting a second one. This also makes
+    // a restored tab request the latest server state immediately.
+    wakeJobPolling();
+    if (state.activePollSequence === state.pollSequence) {
+      return;
+    }
+
+    const sequence = ++state.pollSequence;
+    void pollJob(sequence).catch((error) => {
+      if (error?.name === "AbortError" || sequence !== state.pollSequence) {
+        return;
+      }
+      showFailure(friendlyError(error));
+    });
+  }
+
+  async function pollJob(sequence) {
+    if (sequence !== state.pollSequence || state.activePollSequence === sequence) {
+      return;
+    }
+
+    state.activePollSequence = sequence;
+    try {
+      while (sequence === state.pollSequence && state.jobId) {
+        if (document.hidden || state.connectionUnavailable) {
+          await waitForPollingOpportunity();
           continue;
         }
-        throw error;
-      }
-      if (sequence !== state.pollSequence) {
-        return;
-      }
-      const payload = await readResponse(response);
 
-      if (sequence !== state.pollSequence) {
-        return;
-      }
+        let response;
+        try {
+          response = await apiFetch(`/api/jobs/${encodeURIComponent(state.jobId)}`);
+        } catch (error) {
+          if (error?.name === "AbortError" || sequence !== state.pollSequence) {
+            return;
+          }
+          if (isNetworkFailure(error) && !state.appClosed) {
+            await waitForPollingOpportunity(POLL_DELAY_MS);
+            continue;
+          }
+          throw error;
+        }
+        if (sequence !== state.pollSequence) {
+          return;
+        }
+        const payload = await readResponse(response);
 
-      if (!response.ok) {
-        throw new Error(getPayloadMessage(payload) || friendlyHttpError(response.status));
-      }
+        if (sequence !== state.pollSequence) {
+          return;
+        }
 
-      state.lastPayload = payload;
-      if (handleJobPayload(payload)) {
-        return;
-      }
+        if (!response.ok) {
+          throw new Error(getPayloadMessage(payload) || friendlyHttpError(response.status));
+        }
 
-      await delay(POLL_DELAY_MS);
+        state.lastPayload = payload;
+        if (handleJobPayload(payload)) {
+          return;
+        }
+
+        await waitForPollingOpportunity(POLL_DELAY_MS);
+      }
+    } finally {
+      if (state.activePollSequence === sequence) {
+        state.activePollSequence = null;
+      }
     }
   }
 
@@ -946,6 +1016,7 @@
 
   function showPass(payload) {
     ++state.pollSequence;
+    state.pollingFinished = true;
     updateProgress("VERIFYING", 100);
     const counts = linkCounts(payload);
     elements.totalLinks.textContent = String(counts.total);
@@ -984,6 +1055,7 @@
 
   function showReview(payload) {
     ++state.pollSequence;
+    state.pollingFinished = true;
     elements.reviewReasons.replaceChildren();
     reviewReasons(payload).forEach((reason) => {
       const item = document.createElement("li");
@@ -1000,6 +1072,7 @@
       return;
     }
     ++state.pollSequence;
+    state.pollingFinished = true;
     elements.failMessage.textContent =
       message || "The file may be damaged or use a feature this version does not support.";
     showView(elements.failView, true);
@@ -1012,6 +1085,7 @@
     ++state.pollSequence;
     state.jobId = null;
     state.lastPayload = null;
+    state.pollingFinished = false;
     setInlineMessage(elements.readyMessage, message);
     showView(elements.readyView, true);
   }
@@ -1024,6 +1098,7 @@
     state.file = null;
     state.jobId = null;
     state.lastPayload = null;
+    state.pollingFinished = false;
     elements.pdfInput.value = "";
     elements.passDownloadMessage.textContent = "";
     elements.reviewDownloadMessage.textContent = "";
@@ -1144,10 +1219,6 @@
     return error.message;
   }
 
-  function delay(milliseconds) {
-    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-  }
-
   elements.pdfInput.addEventListener("change", (event) => chooseFile(event.target.files));
 
   elements.dropZone.addEventListener("keydown", (event) => {
@@ -1214,6 +1285,16 @@
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && !state.appClosed) {
         void sendHeartbeat();
+        resumeActiveJobPolling();
+      } else {
+        // Interrupt a scheduled retry so it cannot keep polling in a hidden tab.
+        wakeJobPolling();
+      }
+    });
+    window.addEventListener("pageshow", () => {
+      if (!document.hidden && !state.appClosed) {
+        void sendHeartbeat();
+        resumeActiveJobPolling();
       }
     });
   }

@@ -20,7 +20,7 @@ It can add:
 ## Download for Windows
 
 1. Open the [latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest).
-2. Download `Make.Interactive.PDFs.v1.3.4.zip`.
+2. Download `Make.Interactive.PDFs.v1.3.5.zip`.
 3. Extract the entire ZIP folder.
 4. Double-click `Make Interactive PDFs.exe`.
 5. Keep the small desktop controller open while using the workspace in Chrome.

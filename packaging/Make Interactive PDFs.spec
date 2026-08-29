@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from importlib.util import find_spec
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -19,8 +20,18 @@ datas = [
 for relative in (
     "VERSION",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
 ):
     datas.append((str(ROOT / relative), "."))
+
+onnxruntime_spec = find_spec("onnxruntime")
+if onnxruntime_spec is None or onnxruntime_spec.origin is None:
+    raise RuntimeError("onnxruntime must be installed before building the Windows app")
+onnxruntime_root = Path(onnxruntime_spec.origin).resolve().parent
+for relative in ("LICENSE", "ThirdPartyNotices.txt", "Privacy.md"):
+    datas.append(
+        (str(onnxruntime_root / relative), "licenses/onnxruntime")
+    )
 datas += collect_data_files("pdfminer")
 datas += collect_data_files("rapidocr")
 for package in (

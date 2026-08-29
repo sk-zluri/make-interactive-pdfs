@@ -8,6 +8,7 @@ import unicodedata
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Sequence
 
 
@@ -21,6 +22,10 @@ MIN_NATIVE_ALNUM_RATIO = 0.35
 MAX_INVALID_CHARACTER_RATIO = 0.02
 MAX_SINGLE_CHARACTER_TOKEN_RATIO = 0.8
 SIGNIFICANT_NON_TEXT_OBJECT_LIMIT = 12
+NAVIGATION_OCR_RENDER_SCALE = 3.0
+NAVIGATION_OCR_RIGHT_COLUMN_RATIO = 0.19
+NAVIGATION_OCR_MAX_BATCH_SIZE = 4
+NAVIGATION_OCR_SEPARATOR_PIXELS = 24
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,48 @@ class OCRSummary:
             "retained_native_pages": list(self.retained_native_pages),
             "no_text_found_pages": list(self.no_text_found_pages),
             "quality_unresolved_pages": list(self.quality_unresolved_pages),
+        }
+
+
+@dataclass(frozen=True)
+class NavigationOCRSummary:
+    """Deterministic audit metadata for targeted page-number-column OCR."""
+
+    engine: str
+    version: str
+    model_sha256: str
+    attempted_pages: tuple[int, ...]
+    rendered_pages: tuple[int, ...]
+    pages_with_words: tuple[int, ...]
+    failed_pages: tuple[int, ...]
+    batch_attempts: tuple[tuple[int, ...], ...]
+    page_word_counts: tuple[tuple[int, int], ...]
+    render_scale: float = NAVIGATION_OCR_RENDER_SCALE
+    right_column_ratio: float = NAVIGATION_OCR_RIGHT_COLUMN_RATIO
+    max_batch_size: int = NAVIGATION_OCR_MAX_BATCH_SIZE
+    render_seconds: float = 0.0
+    ocr_seconds: float = 0.0
+    total_seconds: float = 0.0
+
+    def as_report(self) -> dict[str, object]:
+        return {
+            "engine": self.engine,
+            "version": self.version,
+            "model_sha256": self.model_sha256,
+            "attempted_pages": list(self.attempted_pages),
+            "rendered_pages": list(self.rendered_pages),
+            "pages_with_words": list(self.pages_with_words),
+            "failed_pages": list(self.failed_pages),
+            "batch_attempts": [list(pages) for pages in self.batch_attempts],
+            "page_word_counts": {
+                str(page): count for page, count in self.page_word_counts
+            },
+            "render_scale": self.render_scale,
+            "right_column_ratio": self.right_column_ratio,
+            "max_batch_size": self.max_batch_size,
+            "render_seconds": self.render_seconds,
+            "ocr_seconds": self.ocr_seconds,
+            "total_seconds": self.total_seconds,
         }
 
 
@@ -230,7 +277,317 @@ def _box_to_word(
         "upright": True,
         "direction": "ltr",
         "ocr_confidence": round(float(confidence), 5),
+        "ocr_text": True,
     }
+
+
+@dataclass
+class _NavigationOCRStrip:
+    page_index: int
+    image: object
+    pixel_width: int
+    pixel_height: int
+    pdf_width: float
+    pdf_height: float
+    crop_x0: float
+    batch_left: int = 0
+
+
+def _navigation_word_for_strip(
+    text: str,
+    confidence: float,
+    box: Sequence[Sequence[float]],
+    strip: _NavigationOCRStrip,
+) -> dict | None:
+    """Map one batch-image OCR box back into full-page visual coordinates."""
+
+    if len(box) < 4:
+        return None
+    try:
+        x_values = [float(point[0]) for point in box]
+        y_values = [float(point[1]) for point in box]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+    strip_left = float(strip.batch_left)
+    strip_right = strip_left + float(strip.pixel_width)
+    tolerance = 1.0
+    if (
+        min(x_values) < strip_left - tolerance
+        or max(x_values) > strip_right + tolerance
+        or max(y_values) < -tolerance
+        or min(y_values) > float(strip.pixel_height) + tolerance
+    ):
+        return None
+
+    local_box = [
+        [float(point[0]) - strip_left, float(point[1])]
+        for point in box
+    ]
+    crop_width = strip.pdf_width - strip.crop_x0
+    word = _box_to_word(
+        text,
+        confidence,
+        local_box,
+        pdf_width=crop_width,
+        pdf_height=strip.pdf_height,
+        image_width=strip.pixel_width,
+        image_height=strip.pixel_height,
+    )
+    if word is None:
+        return None
+    word["x0"] = max(0.0, min(strip.pdf_width, word["x0"] + strip.crop_x0))
+    word["x1"] = max(0.0, min(strip.pdf_width, word["x1"] + strip.crop_x0))
+    if word["x1"] <= word["x0"]:
+        return None
+    word["ocr_navigation"] = True
+    return word
+
+
+def ocr_navigation_columns(
+    input_path: Path,
+    analyses: Sequence[object],
+    page_indices: Sequence[int],
+    *,
+    password: str | None = None,
+    rotations: Sequence[int] | None = None,
+    right_column_ratio: float = NAVIGATION_OCR_RIGHT_COLUMN_RATIO,
+    render_scale: float = NAVIGATION_OCR_RENDER_SCALE,
+    batch_size: int = NAVIGATION_OCR_MAX_BATCH_SIZE,
+) -> tuple[dict[int, list[dict]], NavigationOCRSummary]:
+    """OCR selected right-hand page-number columns in small horizontal batches.
+
+    Page indices and dictionary keys are zero based, matching ``analyses``.
+    Summary page numbers are one based for user-facing reports. PDFium applies a
+    page's intrinsic rotation before cropping; dimensions and any supplied
+    rotation are checked so uncertain coordinate transforms fail closed.
+    """
+
+    selected = tuple(sorted({int(page_index) for page_index in page_indices}))
+    if not 0.0 < float(right_column_ratio) < 1.0:
+        raise ValueError("right_column_ratio must be between 0 and 1")
+    if float(render_scale) <= 0.0:
+        raise ValueError("render_scale must be positive")
+    if not 1 <= int(batch_size) <= NAVIGATION_OCR_MAX_BATCH_SIZE:
+        raise ValueError(
+            f"batch_size must be between 1 and {NAVIGATION_OCR_MAX_BATCH_SIZE}"
+        )
+
+    analysis_by_page = {
+        int(getattr(analysis, "page_index")): analysis for analysis in analyses
+    }
+    missing = [page for page in selected if page < 0 or page not in analysis_by_page]
+    if missing:
+        raise ValueError(f"Selected page indices are unavailable: {missing}")
+    if rotations is not None and selected and max(selected) >= len(rotations):
+        raise ValueError("rotations does not cover every selected page")
+
+    try:
+        version = metadata.version("rapidocr")
+    except metadata.PackageNotFoundError:
+        version = "unavailable"
+
+    engine_name = "RapidOCR (ONNX Runtime)"
+    if not selected:
+        return {}, NavigationOCRSummary(
+            engine=engine_name,
+            version=version,
+            model_sha256="",
+            attempted_pages=(),
+            rendered_pages=(),
+            pages_with_words=(),
+            failed_pages=(),
+            batch_attempts=(),
+            page_word_counts=(),
+            render_scale=float(render_scale),
+            right_column_ratio=float(right_column_ratio),
+            max_batch_size=int(batch_size),
+        )
+
+    started_at = perf_counter()
+    try:
+        import numpy as np
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError("The bundled local PDF renderer is unavailable") from exc
+    try:
+        import rapidocr
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        raise RuntimeError("The bundled local OCR engine is unavailable") from exc
+
+    package_root = Path(rapidocr.__file__).resolve().parent
+    engine = RapidOCR(
+        params={
+            "Global.log_level": "error",
+            "Global.return_word_box": True,
+        }
+    )
+    document = pdfium.PdfDocument(str(input_path), password=password)
+    if selected and max(selected) >= len(document):
+        document.close()
+        raise ValueError("Selected page index exceeds the PDF page count")
+
+    render_seconds = 0.0
+    ocr_seconds = 0.0
+    rendered_pages: list[int] = []
+    failed_pages: set[int] = set()
+    batch_attempts: list[tuple[int, ...]] = []
+    detected_by_page: dict[int, list[dict]] = {}
+
+    try:
+        for chunk_start in range(0, len(selected), int(batch_size)):
+            chunk = selected[chunk_start : chunk_start + int(batch_size)]
+            strips: list[_NavigationOCRStrip] = []
+            for page_index in chunk:
+                render_started_at = perf_counter()
+                try:
+                    analysis = analysis_by_page[page_index]
+                    page = document[page_index]
+                    actual_rotation = int(page.get_rotation() or 0) % 360
+                    expected_rotation = (
+                        int(rotations[page_index] or 0) % 360
+                        if rotations is not None
+                        else int(getattr(analysis, "rotation", actual_rotation) or 0) % 360
+                    )
+                    if actual_rotation not in {0, 90, 180, 270}:
+                        raise ValueError("Unsupported PDF page rotation")
+                    if expected_rotation != actual_rotation:
+                        raise ValueError("Page rotation metadata does not match the renderer")
+
+                    rendered_width, rendered_height = (
+                        float(value) for value in page.get_size()
+                    )
+                    pdf_width = float(getattr(analysis, "width"))
+                    pdf_height = float(getattr(analysis, "height"))
+                    if min(rendered_width, rendered_height, pdf_width, pdf_height) <= 0.0:
+                        raise ValueError("Page dimensions must be positive")
+                    width_delta = abs(rendered_width - pdf_width) / max(
+                        rendered_width, pdf_width
+                    )
+                    height_delta = abs(rendered_height - pdf_height) / max(
+                        rendered_height, pdf_height
+                    )
+                    if width_delta > 0.01 or height_delta > 0.01:
+                        raise ValueError("Page geometry does not match the extracted analysis")
+
+                    rendered_crop_x0 = rendered_width * (1.0 - right_column_ratio)
+                    bitmap = page.render(
+                        scale=float(render_scale),
+                        crop=(rendered_crop_x0, 0.0, 0.0, 0.0),
+                    )
+                    image = np.asarray(bitmap.to_pil().convert("RGB"))
+                    if image.ndim != 3 or image.shape[0] <= 0 or image.shape[1] <= 0:
+                        raise ValueError("Navigation crop rendered an empty image")
+                    pixel_height, pixel_width = (int(value) for value in image.shape[:2])
+                    strips.append(
+                        _NavigationOCRStrip(
+                            page_index=page_index,
+                            image=image,
+                            pixel_width=pixel_width,
+                            pixel_height=pixel_height,
+                            pdf_width=pdf_width,
+                            pdf_height=pdf_height,
+                            crop_x0=pdf_width * (1.0 - right_column_ratio),
+                        )
+                    )
+                    rendered_pages.append(page_index + 1)
+                except Exception:
+                    failed_pages.add(page_index + 1)
+                finally:
+                    render_seconds += perf_counter() - render_started_at
+
+            if not strips:
+                continue
+
+            max_height = max(strip.pixel_height for strip in strips)
+            total_width = sum(strip.pixel_width for strip in strips)
+            total_width += NAVIGATION_OCR_SEPARATOR_PIXELS * (len(strips) - 1)
+            batch_image = np.full((max_height, total_width, 3), 255, dtype=np.uint8)
+            next_left = 0
+            for strip in strips:
+                strip.batch_left = next_left
+                batch_image[
+                    : strip.pixel_height,
+                    next_left : next_left + strip.pixel_width,
+                ] = strip.image
+                next_left += strip.pixel_width + NAVIGATION_OCR_SEPARATOR_PIXELS
+
+            batch_pages = tuple(strip.page_index + 1 for strip in strips)
+            batch_attempts.append(batch_pages)
+            ocr_started_at = perf_counter()
+            try:
+                result = engine(batch_image, return_word_box=True)
+                for strip in strips:
+                    detected_by_page[strip.page_index] = []
+                for line in (getattr(result, "word_results", None) or ()):
+                    for text, confidence, box in line:
+                        if len(box) < 4:
+                            continue
+                        try:
+                            center_x = sum(float(point[0]) for point in box) / len(box)
+                        except (IndexError, TypeError, ValueError, ZeroDivisionError):
+                            continue
+                        strip = next(
+                            (
+                                candidate
+                                for candidate in strips
+                                if candidate.batch_left
+                                <= center_x
+                                < candidate.batch_left + candidate.pixel_width
+                            ),
+                            None,
+                        )
+                        if strip is None:
+                            continue
+                        word = _navigation_word_for_strip(
+                            text, confidence, box, strip
+                        )
+                        if word is not None:
+                            detected_by_page[strip.page_index].append(word)
+                for strip in strips:
+                    detected_by_page[strip.page_index].sort(
+                        key=lambda word: (
+                            round(float(word["top"]), 5),
+                            round(float(word["x0"]), 5),
+                            str(word["text"]),
+                        )
+                    )
+            except Exception:
+                for strip in strips:
+                    failed_pages.add(strip.page_index + 1)
+                    detected_by_page.pop(strip.page_index, None)
+            finally:
+                ocr_seconds += perf_counter() - ocr_started_at
+    finally:
+        document.close()
+
+    page_word_counts = tuple(
+        (page_index + 1, len(detected_by_page[page_index]))
+        for page_index in sorted(detected_by_page)
+    )
+    model_sha256 = _model_fingerprint(package_root)
+    total_seconds = perf_counter() - started_at
+    summary = NavigationOCRSummary(
+        engine=engine_name,
+        version=version,
+        model_sha256=model_sha256,
+        attempted_pages=tuple(page + 1 for page in selected),
+        rendered_pages=tuple(rendered_pages),
+        pages_with_words=tuple(
+            page for page, count in page_word_counts if count > 0
+        ),
+        failed_pages=tuple(sorted(failed_pages)),
+        batch_attempts=tuple(batch_attempts),
+        page_word_counts=page_word_counts,
+        render_scale=float(render_scale),
+        right_column_ratio=float(right_column_ratio),
+        max_batch_size=int(batch_size),
+        render_seconds=round(render_seconds, 4),
+        ocr_seconds=round(ocr_seconds, 4),
+        total_seconds=round(total_seconds, 4),
+    )
+    return detected_by_page, summary
 
 
 def _word_result_score(result: object) -> tuple[int, float]:
