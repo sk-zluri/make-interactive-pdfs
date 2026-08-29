@@ -62,8 +62,10 @@ class _FakePage:
         self,
         *,
         scale: float,
-        crop: tuple[float, float, float, float],
+        crop: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+        grayscale: bool = False,
     ) -> _FakeBitmap:
+        del grayscale
         self.render_calls.append((scale, crop))
         pixel_width = round((self.width - crop[0] - crop[2]) * scale)
         pixel_height = round((self.height - crop[1] - crop[3]) * scale)
@@ -352,6 +354,143 @@ class NavigationOCRTests(unittest.TestCase):
         self.assertEqual(summary.batch_count, 2)
         self.assertEqual(summary.failed_regions, ())
         self.assertEqual(summary.regions_with_words, tuple(f"footer-{index}" for index in range(5)))
+
+    def test_margin_regions_on_one_page_are_all_queued(self) -> None:
+        page = _FakePage(200.0, 100.0, 0, 20)
+        analysis = SimpleNamespace(page_index=0, width=200.0, height=100.0, rotation=0)
+        regions = [
+            local_ocr.MarginOCRRegion("footer-left", 0, 0.10, 0.84, 0.40, 1.0),
+            local_ocr.MarginOCRRegion("footer-right", 0, 0.60, 0.84, 0.90, 1.0),
+        ]
+        result = SimpleNamespace(
+            word_results=(
+                (
+                    ("left", 0.99, _box(5, 10, 50, 35)),
+                    ("right", 0.98, _box(269, 10, 314, 35)),
+                ),
+            )
+        )
+        context, document, _ = self._module_context([page], [result])
+        with (
+            context,
+            patch.object(local_ocr.metadata, "version", return_value="test-version"),
+            patch.object(local_ocr, "_model_fingerprint", return_value="model-hash"),
+        ):
+            detected, summary = local_ocr.ocr_margin_regions(
+                Path("fixture.pdf"),
+                [analysis],
+                regions,
+                rotations=[0],
+            )
+
+        self.assertTrue(document.closed)
+        self.assertEqual(detected["footer-left"], [("left", 0.99)])
+        self.assertEqual(detected["footer-right"], [("right", 0.98)])
+        self.assertEqual(summary.failed_regions, ())
+        self.assertEqual(summary.regions_with_words, ("footer-left", "footer-right"))
+        engine = _FakeRapidOCR.instances[0]
+        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(engine.calls[0].shape, (64, 504, 3))
+
+    def test_full_page_ocr_skips_missing_or_malformed_word_results(self) -> None:
+        pages = [_FakePage(100.0, 100.0, 0, 20) for _ in range(3)]
+        analyses = [
+            SimpleNamespace(
+                page_index=index,
+                words=[],
+                raw_text="",
+                width=100.0,
+                height=100.0,
+                rotation=0,
+                image_area_ratio=0.9,
+            )
+            for index in range(3)
+        ]
+        results = [
+            SimpleNamespace(),
+            SimpleNamespace(word_results=object()),
+            SimpleNamespace(word_results=(("bad", 0.99, None),)),
+        ]
+        context, document, _ = self._module_context(pages, results)
+        with (
+            context,
+            patch.object(local_ocr.metadata, "version", return_value="test-version"),
+            patch.object(local_ocr, "_model_fingerprint", return_value="model-hash"),
+        ):
+            replacements, summary = local_ocr.ocr_low_text_pages(
+                Path("fixture.pdf"),
+                analyses,
+                rotations=[0, 0, 0],
+            )
+
+        self.assertTrue(document.closed)
+        self.assertEqual(replacements, {})
+        self.assertEqual(summary.attempted_pages, (1, 2, 3))
+        self.assertEqual(summary.failed_pages, ())
+        self.assertEqual(summary.no_text_found_pages, (1, 2, 3))
+        self.assertEqual(summary.as_report()["failed_page_diagnostics"], [])
+
+    def test_ocr_failure_diagnostic_does_not_expose_exception_text(self) -> None:
+        diagnostic = local_ocr._ocr_failure_diagnostic(
+            4,
+            "recognize",
+            RuntimeError(r"D:\private\customer.pdf could not be read"),
+        ).as_report()
+
+        self.assertEqual(
+            diagnostic,
+            {
+                "page": 4,
+                "stage": "recognize",
+                "reason": "The local OCR engine did not return a readable result",
+                "error_type": "RuntimeError",
+            },
+        )
+        self.assertNotIn("customer.pdf", str(diagnostic))
+
+    def test_full_page_ocr_reports_a_sanitized_failure(self) -> None:
+        class FailingPage(_FakePage):
+            def render(self, **kwargs: object) -> _FakeBitmap:
+                if kwargs["scale"] == local_ocr.OCR_RENDER_SCALE:
+                    raise RuntimeError(r"D:\private\customer.pdf could not be read")
+                return super().render(**kwargs)
+
+        page = FailingPage(100.0, 100.0, 0, 20)
+        analysis = SimpleNamespace(
+            page_index=0,
+            words=[],
+            raw_text="",
+            width=100.0,
+            height=100.0,
+            rotation=0,
+            image_area_ratio=0.9,
+        )
+        context, document, _ = self._module_context([page], [SimpleNamespace()])
+        with (
+            context,
+            patch.object(local_ocr.metadata, "version", return_value="test-version"),
+            patch.object(local_ocr, "_model_fingerprint", return_value="model-hash"),
+        ):
+            _replacements, summary = local_ocr.ocr_low_text_pages(
+                Path("fixture.pdf"),
+                [analysis],
+                rotations=[0],
+            )
+
+        self.assertTrue(document.closed)
+        self.assertEqual(summary.failed_pages, (1,))
+        self.assertEqual(
+            summary.as_report()["failed_page_diagnostics"],
+            [
+                {
+                    "page": 1,
+                    "stage": "render",
+                    "reason": "Could not render the page for OCR",
+                    "error_type": "RuntimeError",
+                }
+            ],
+        )
+        self.assertNotIn("customer.pdf", str(summary.as_report()))
 
 
 if __name__ == "__main__":

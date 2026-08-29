@@ -32,6 +32,48 @@ MARGIN_OCR_SEPARATOR_PIXELS = 24
 
 
 @dataclass(frozen=True)
+class OCRFailureDiagnostic:
+    """A privacy-safe explanation for one failed full-page OCR attempt."""
+
+    page: int
+    stage: str
+    reason: str
+    error_type: str
+
+    def as_report(self) -> dict[str, object]:
+        return {
+            "page": self.page,
+            "stage": self.stage,
+            "reason": self.reason,
+            "error_type": self.error_type,
+        }
+
+
+_OCR_FAILURE_REASONS = {
+    "render": "Could not render the page for OCR",
+    "recognize": "The local OCR engine did not return a readable result",
+    "parse": "The OCR response contained unusable word data",
+    "choose": "The OCR result could not be applied safely",
+}
+
+
+def _ocr_failure_diagnostic(
+    page: int,
+    stage: str,
+    error: BaseException,
+) -> OCRFailureDiagnostic:
+    """Keep operational diagnostics useful without exposing exception text or paths."""
+
+    error_type = re.sub(r"[^A-Za-z0-9_]", "", type(error).__name__)[:80]
+    return OCRFailureDiagnostic(
+        page=page,
+        stage=stage,
+        reason=_OCR_FAILURE_REASONS.get(stage, "The local OCR attempt could not be completed"),
+        error_type=error_type or "UnknownError",
+    )
+
+
+@dataclass(frozen=True)
 class OCRSummary:
     engine: str
     version: str
@@ -40,6 +82,7 @@ class OCRSummary:
     enriched_pages: tuple[int, ...]
     failed_pages: tuple[int, ...]
     attempt_reasons: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    failed_page_diagnostics: tuple[OCRFailureDiagnostic, ...] = ()
     skipped_blank_pages: tuple[int, ...] = ()
     native_text_pages: int = 0
     replaced_pages: tuple[int, ...] = ()
@@ -59,6 +102,9 @@ class OCRSummary:
             "attempt_reasons": {
                 reason: list(pages) for reason, pages in self.attempt_reasons
             },
+            "failed_page_diagnostics": [
+                diagnostic.as_report() for diagnostic in self.failed_page_diagnostics
+            ],
             "skipped_blank_pages": list(self.skipped_blank_pages),
             "native_text_pages": self.native_text_pages,
             "replaced_pages": list(self.replaced_pages),
@@ -651,7 +697,14 @@ class _MarginOCRStrip:
 def _iter_word_results(result: object):
     """Accept RapidOCR's single-image and batched result shapes."""
 
-    for item in (getattr(result, "word_results", None) or ()):
+    try:
+        word_results = getattr(result, "word_results", None)
+    except Exception:
+        return
+    if not isinstance(word_results, (tuple, list)):
+        return
+
+    for item in word_results:
         if (
             isinstance(item, (tuple, list))
             and len(item) == 3
@@ -659,7 +712,9 @@ def _iter_word_results(result: object):
         ):
             yield item
             continue
-        for candidate in item or ():
+        if not isinstance(item, (tuple, list)):
+            continue
+        for candidate in item:
             if (
                 isinstance(candidate, (tuple, list))
                 and len(candidate) == 3
@@ -819,14 +874,14 @@ def ocr_margin_regions(
                     if x1 <= x0 or bottom <= top:
                         failed_regions.add(region.key)
                         continue
-                strips.append(
-                    _MarginOCRStrip(
-                        region=region,
-                        # Keep only the small crop. A NumPy view would retain
-                        # the full rendered page for the rest of OCR batching.
-                        image=image[top:bottom, x0:x1].copy(),
+                    strips.append(
+                        _MarginOCRStrip(
+                            region=region,
+                            # Keep only the small crop. A NumPy view would retain
+                            # the full rendered page for the rest of OCR batching.
+                            image=image[top:bottom, x0:x1].copy(),
+                        )
                     )
-                )
             except Exception:
                 failed_regions.update(region.key for region in page_regions)
             finally:
@@ -912,12 +967,13 @@ def ocr_margin_regions(
 
 
 def _word_result_score(result: object) -> tuple[int, float]:
-    words = [
-        word
-        for line in (getattr(result, "word_results", None) or ())
-        for word in line
-    ]
-    return len(words), sum(float(word[1]) for word in words)
+    confidences: list[float] = []
+    for _text, confidence, _box in _iter_word_results(result):
+        try:
+            confidences.append(float(confidence))
+        except (TypeError, ValueError):
+            continue
+    return len(confidences), sum(confidences)
 
 
 def _overlap_ratio(first: dict, second: dict) -> float:
@@ -1155,6 +1211,7 @@ def ocr_low_text_pages(
     replacements: dict[int, list[dict]] = {}
     enriched: list[int] = []
     failed: list[int] = []
+    failed_page_diagnostics: dict[int, OCRFailureDiagnostic] = {}
     replaced: list[int] = []
     merged_pages: list[int] = []
     retained_native: list[int] = []
@@ -1167,11 +1224,13 @@ def ocr_low_text_pages(
             if on_page_started is not None:
                 on_page_started(position - 1, total, page_index)
             analysis = analyses[page_index]
+            stage = "render"
             try:
                 page = document[page_index]
                 bitmap = page.render(scale=OCR_RENDER_SCALE)
                 image = np.asarray(bitmap.to_pil())
                 image_height, image_width = image.shape[:2]
+                stage = "recognize"
                 result = engine(image, return_word_box=True)
                 selected_result = result
                 selected_turns = 0
@@ -1190,8 +1249,9 @@ def ocr_low_text_pages(
                 if selected_turns and page_rotation in (90, 270):
                     pdf_width, pdf_height = pdf_height, pdf_width
                 detected: list[dict] = []
-                for line in selected_result.word_results or ():
-                    for text, confidence, box in line:
+                stage = "parse"
+                for text, confidence, box in _iter_word_results(selected_result):
+                    try:
                         word = _box_to_word(
                             text,
                             confidence,
@@ -1201,12 +1261,15 @@ def ocr_low_text_pages(
                             image_width=int(selected_image_width),
                             image_height=int(selected_image_height),
                         )
-                        if word is not None:
-                            if selected_turns:
-                                word["_ocr_rotation_normalized"] = True
-                            detected.append(word)
+                    except (ArithmeticError, IndexError, TypeError, ValueError):
+                        continue
+                    if word is not None:
+                        if selected_turns:
+                            word["_ocr_rotation_normalized"] = True
+                        detected.append(word)
                 native_words = list(getattr(analysis, "words"))
                 decision = decisions[page_index]
+                stage = "choose"
                 selected_words, outcome = choose_page_words(
                     native_words,
                     detected,
@@ -1227,10 +1290,21 @@ def ocr_low_text_pages(
                 elif outcome == "quality_unresolved":
                     quality_unresolved.append(page_index + 1)
                     failed.append(page_index + 1)
+                    failed_page_diagnostics[page_index + 1] = OCRFailureDiagnostic(
+                        page=page_index + 1,
+                        stage="quality_check",
+                        reason="Recognized text did not meet the quality threshold",
+                        error_type="QualityCheck",
+                    )
                 if on_page_finished is not None:
                     on_page_finished(position, total, page_index, len(detected))
-            except Exception:
+            except Exception as exc:
                 failed.append(page_index + 1)
+                failed_page_diagnostics[page_index + 1] = _ocr_failure_diagnostic(
+                    page_index + 1,
+                    stage,
+                    exc,
+                )
                 if on_page_finished is not None:
                     on_page_finished(position, total, page_index, 0)
     finally:
@@ -1245,6 +1319,9 @@ def ocr_low_text_pages(
         failed_pages=tuple(sorted(set(failed))),
         attempt_reasons=tuple(
             (reason, tuple(pages)) for reason, pages in sorted(reason_pages.items())
+        ),
+        failed_page_diagnostics=tuple(
+            failed_page_diagnostics[page] for page in sorted(failed_page_diagnostics)
         ),
         skipped_blank_pages=tuple(sorted(set(skipped_blank_pages))),
         native_text_pages=native_text_pages,

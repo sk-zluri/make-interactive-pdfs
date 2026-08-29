@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from difflib import SequenceMatcher
 import hashlib
 import json
 import math
@@ -52,6 +53,12 @@ PAGE_TOKEN_RE = re.compile(r"^[\s.·•()\[\]-]*([0-9]{1,4}|[ivxlcdm]{1,10})[\s.
 PAGE_RANGE_RE = re.compile(
     r"^[\s.·•()\[\]]*([0-9]{1,4})\s*[-–—―�]+\s*([0-9]{1,4})[\s.·•()\[\]]*$"
 )
+SECTION_PAGE_LABEL_RE = re.compile(
+    r"^\s*([1-9][0-9]{0,2})\s*[-–—]\s*([1-9][0-9]{0,3})\s*$"
+)
+SECTION_PAGE_LABEL_IN_LINE_RE = re.compile(
+    r"(?<![0-9])([1-9][0-9]{0,2})\s*[-–—]\s*([1-9][0-9]{0,3})(?![0-9])"
+)
 ORDINAL_TOKEN_RE = re.compile(r"^\s*([0-9]{1,4}|[ivxlcdm]{1,10})[.·):\-]+\s*$", re.I)
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}$", re.I)
 URL_RE = re.compile(r"^(?:https?://|www\.)[^\s<>]+$", re.I)
@@ -63,6 +70,15 @@ BLOCKED_FILE_TLDS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "png", 
 TRAILING_URL_PUNCTUATION = ".,;:!?)]}>'\""
 LEADING_URL_PUNCTUATION = "([{<'\""
 STOPWORDS = {"a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with"}
+VERIFIED_LINKS_SELECTION_POLICY = "automatic-verified-subset-v1"
+VERIFIED_INTERNAL_MATCH_METHODS = frozenset(
+    {
+        "pagination-segment",
+        "unique-title",
+        "title-only-opener",
+        "section-page-label",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +110,121 @@ class AddedLink:
     matched_by: str | None = None
     confidence: str | None = None
     evidence: dict = field(default_factory=dict)
+
+
+def canonical_json_sha256(value: object) -> str:
+    """Return a stable digest for a JSON-compatible report value."""
+
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def is_verified_link_candidate(link: AddedLink) -> bool:
+    """Whether a link is safe to carry into an automatic partial output.
+
+    Review reports retain all candidates for diagnosis.  The partial-output
+    path is intentionally stricter: it never replays a medium/low internal
+    mapping or a URI recovered from annotation metadata rather than visible
+    text.
+    """
+
+    if link.kind == "internal":
+        return (
+            link.confidence == "high"
+            and link.matched_by in VERIFIED_INTERNAL_MATCH_METHODS
+            and isinstance(link.target_page, int)
+        )
+    if link.kind == "external":
+        return (
+            isinstance(link.uri, str)
+            and supported_uri(link.uri)
+            and isinstance(link.label, str)
+            and normalized_uri(link.label, allow_bare_domains=False) == link.uri
+        )
+    return False
+
+
+def verified_link_subset(
+    links: Sequence[AddedLink],
+    *,
+    relevant_ocr_failures: Sequence[int] = (),
+    navigation_ocr_failures: Sequence[int] = (),
+) -> list[AddedLink]:
+    """Return only links that are safe for an automatic partial output.
+
+    A failed OCR check on evidence needed to establish a link means the
+    engine cannot honestly call *any* automatic subset "verified".  Rather
+    than trying to infer exactly which rows might have been affected, fail
+    closed and require a normal reviewed-manifest workflow.
+    """
+
+    if relevant_ocr_failures or navigation_ocr_failures:
+        return []
+    return [link for link in links if is_verified_link_candidate(link)]
+
+
+def classify_ocr_failure_relevance(
+    failed_pages: Iterable[int],
+    *,
+    toc_pages: Iterable[int],
+    navigation_ocr_pages: Iterable[int],
+    navigation_candidate_pages: Iterable[int],
+    planned_links: Sequence[AddedLink],
+    unresolved_rows: Sequence[Mapping[str, object]],
+    margin_checks: Sequence[MarginOCRCheck],
+) -> tuple[list[int], list[int]]:
+    """Split 1-based OCR failures into link-relevant and unrelated pages.
+
+    A failed scan is only a release blocker when it affects evidence used to
+    decide an annotation.  This deliberately stays conservative: contents
+    pages, link source/destination pages, unresolved destination candidates,
+    and prompted page-number checks are all relevant.
+    """
+
+    failed = {int(page) for page in failed_pages if isinstance(page, int) and page > 0}
+    # Navigation OCR pages are accumulated in a list so their processing order
+    # remains deterministic.  Convert here rather than relying on callers to
+    # remember the set requirement for this conservative relevance check.
+    relevant = {
+        page_index + 1
+        for page_index in set(toc_pages) | set(navigation_ocr_pages)
+    }
+    relevant.update(
+        page_index + 1
+        for page_index in navigation_candidate_pages
+        if isinstance(page_index, int) and page_index >= 0
+    )
+
+    for link in planned_links:
+        relevant.add(link.source_page + 1)
+        if link.kind == "internal" and link.target_page is not None:
+            relevant.add(link.target_page + 1)
+
+    for row in unresolved_rows:
+        source_page = row.get("source_page")
+        if isinstance(source_page, int) and source_page > 0:
+            relevant.add(source_page)
+        evidence = row.get("evidence")
+        if isinstance(evidence, Mapping):
+            candidates = evidence.get("candidate_target_pages")
+            if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+                relevant.update(
+                    int(page)
+                    for page in candidates
+                    if isinstance(page, int) and page > 0
+                )
+
+    for check in margin_checks:
+        relevant.add(check.region.page_index + 1)
+
+    relevant_failures = sorted(failed & relevant)
+    unrelated_failures = sorted(failed - relevant)
+    return relevant_failures, unrelated_failures
 
 
 @dataclass(frozen=True)
@@ -333,6 +464,24 @@ def page_range_candidates(
     return candidates
 
 
+def section_page_label(value: str) -> str | None:
+    """Normalize a technical section-page label such as ``3-67``."""
+
+    match = SECTION_PAGE_LABEL_RE.fullmatch(str(value))
+    if match is None:
+        return None
+    return f"{int(match.group(1))}-{int(match.group(2))}"
+
+
+def toc_rows_use_section_page_labels(rows: Sequence[TocRow]) -> bool:
+    """Recognize a technical contents list that uses section-page labels."""
+
+    labels = [section_page_label(row.printed_label) for row in rows]
+    complete_labels = [label for label in labels if label is not None]
+    sections = {label.split("-", maxsplit=1)[0] for label in complete_labels}
+    return len(complete_labels) >= 3 and len(sections) >= 2
+
+
 def group_words_into_lines(words: Sequence[dict], tolerance: float = 3.0) -> list[list[dict]]:
     lines: list[list[dict]] = []
     for word in sorted(words, key=lambda item: (float(item["top"]), float(item["x0"]))):
@@ -352,7 +501,7 @@ def group_words_into_lines(words: Sequence[dict], tolerance: float = 3.0) -> lis
 def _is_toc_heading_text(normalized: str) -> bool:
     is_named_volume = bool(
         re.fullmatch(
-            r"(?:table of contents|contents) (?:volume|part|book) "
+        r"(?:table of contents|contents)(?: of)? (?:volume|part|book) "
             r"(?:[0-9]{1,3}|[ivxlcdm]{1,10})",
             normalized,
             flags=re.I,
@@ -1146,6 +1295,37 @@ def detect_toc_pages(
     return toc_pages, rows_by_page
 
 
+def toc_page_needs_label_repair_ocr(
+    analysis: PageAnalysis,
+    rows: Sequence[TocRow],
+) -> bool:
+    """Identify a scanned Contents page whose right-hand labels are corrupt.
+
+    The narrow navigation OCR pass reads only the page-number column, so it
+    should be reserved for an already-recognised contents page with evidence
+    that the native labels are malformed.  This avoids broad OCR for ordinary
+    selectable-text PDFs.
+    """
+
+    if analysis.image_area_ratio < 0.55 or len(rows) < 2:
+        return False
+
+    labels = [str(row.printed_label or "").strip() for row in rows]
+    malformed_label = any(
+        not label
+        or (
+            parse_page_label_details(label) is None
+            and PAGE_RANGE_RE.fullmatch(label) is None
+        )
+        for label in labels
+    )
+    numbers = [row.printed_number for row in rows if row.printed_number is not None]
+    non_increasing_labels = any(
+        later <= earlier for earlier, later in zip(numbers, numbers[1:])
+    )
+    return malformed_label or non_increasing_labels
+
+
 def headingless_navigation_candidates(
     analyses: Sequence[PageAnalysis],
     toc_pages: set[int],
@@ -1364,6 +1544,78 @@ def unique_title_destination(
     return scores[0][1], scores[0][0]
 
 
+def unique_title_only_opener_destination(
+    title: str,
+    analyses: Sequence[PageAnalysis],
+    excluded_pages: set[int],
+    *,
+    allowed_pages: set[int] | None = None,
+) -> tuple[int | None, float]:
+    """Find a uniquely titled sparse opener without trusting running headers.
+
+    This is deliberately narrower than :func:`unique_title_destination`.
+    A repeated chapter title in page headers is not enough evidence, but a
+    near-title-only page with one unambiguous title line can safely identify a
+    section opening when pagination evidence is unavailable.
+    """
+
+    normalized_title = normalize_text(title)
+    if len(normalized_title) < 5:
+        return None, 0.0
+
+    scores: list[tuple[float, int]] = []
+    for analysis in analyses:
+        page_index = analysis.page_index
+        if page_index in excluded_pages or (
+            allowed_pages is not None and page_index not in allowed_pages
+        ):
+            continue
+        if len(analysis.words) > 20 or len(analysis.lines) > 5:
+            continue
+
+        title_line_scores: list[float] = []
+        for line in analysis.lines:
+            if not line:
+                continue
+            line_top = min(float(word["top"]) for word in line)
+            if line_top > analysis.height * 0.58:
+                continue
+            normalized_line = normalize_text(
+                " ".join(str(word["text"]) for word in line)
+            )
+            if len(normalized_line) < 5:
+                continue
+            direct_score = title_match_score(title, normalized_line)
+            line_tokens = normalized_line.split()
+            title_token_count = len(normalized_title.split())
+            fuzzy_score = 0.0
+            for window_size in range(
+                max(1, title_token_count - 1),
+                min(len(line_tokens), title_token_count + 2) + 1,
+            ):
+                for start in range(0, len(line_tokens) - window_size + 1):
+                    fuzzy_score = max(
+                        fuzzy_score,
+                        SequenceMatcher(
+                            None,
+                            normalized_title,
+                            " ".join(line_tokens[start : start + window_size]),
+                        ).ratio(),
+                    )
+            title_line_scores.append(max(direct_score, fuzzy_score))
+
+        score = max(title_line_scores, default=0.0)
+        if score >= 0.90:
+            scores.append((score, page_index))
+
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] < 0.90:
+        return None, scores[0][0] if scores else 0.0
+    if len(scores) > 1 and abs(scores[0][0] - scores[1][0]) < 0.05:
+        return None, scores[0][0]
+    return scores[0][1], scores[0][0]
+
+
 def toc_title_variants(title: str, ordinal: int | None = None) -> list[str]:
     """Return the full title plus only the fragment owned by this row ordinal."""
 
@@ -1554,6 +1806,127 @@ def visible_margin_numbers(analysis: PageAnalysis, label_kind: str) -> list[int]
             and eligible_margin_observation(observation)
         }
     )
+
+
+def visible_section_page_labels(analysis: PageAnalysis) -> set[str]:
+    """Return compound section-page labels found in a header or footer band."""
+
+    labels: set[str] = set()
+
+    def collect(text: str) -> None:
+        for match in SECTION_PAGE_LABEL_IN_LINE_RE.finditer(text):
+            labels.add(f"{int(match.group(1))}-{int(match.group(2))}")
+
+    for line in analysis.lines:
+        if not line:
+            continue
+        top = min(float(word["top"]) for word in line)
+        if not (top <= analysis.height * 0.08 or top >= analysis.height * 0.88):
+            continue
+        text = " ".join(
+            str(word["text"]) for word in sorted(line, key=lambda word: float(word["x0"]))
+        )
+        collect(text)
+
+    # Landscape technical pages often rotate the printed section-page label
+    # along an outer vertical edge.  Their three tokens then sit on successive
+    # horizontal text lines, so the header/footer pass above cannot see them
+    # as one label.  Look only at the narrow outer edges and join immediately
+    # adjacent vertical tokens; ordinary page content is never considered.
+    if analysis.width > analysis.height:
+        edge_width = analysis.width * 0.08
+        gap_limit = max(12.0, analysis.height * 0.025)
+        for edge_words in (
+            [
+                word
+                for word in analysis.words
+                if (float(word["x0"]) + float(word["x1"])) / 2 <= edge_width
+            ],
+            [
+                word
+                for word in analysis.words
+                if (float(word["x0"]) + float(word["x1"])) / 2
+                >= analysis.width - edge_width
+            ],
+        ):
+            columns: list[list[dict]] = []
+            for word in sorted(
+                edge_words,
+                key=lambda item: (float(item["x0"]) + float(item["x1"])) / 2,
+            ):
+                center = (float(word["x0"]) + float(word["x1"])) / 2
+                if not columns:
+                    columns.append([word])
+                    continue
+                previous = columns[-1]
+                previous_center = sum(
+                    (float(item["x0"]) + float(item["x1"])) / 2
+                    for item in previous
+                ) / len(previous)
+                if abs(center - previous_center) <= max(6.0, analysis.width * 0.012):
+                    previous.append(word)
+                else:
+                    columns.append([word])
+
+            for column in columns:
+                ordered = sorted(column, key=lambda item: float(item["top"]))
+                for start, first in enumerate(ordered):
+                    tokens = [str(first["text"]).strip()]
+                    previous_bottom = float(first["bottom"])
+                    normalized = section_page_label(tokens[0])
+                    if normalized is not None:
+                        labels.add(normalized)
+                    for following in ordered[start + 1 : start + 3]:
+                        if float(following["top"]) - previous_bottom > gap_limit:
+                            break
+                        tokens.append(str(following["text"]).strip())
+                        previous_bottom = float(following["bottom"])
+                    if (
+                        len(tokens) == 3
+                        and tokens[0].isdigit()
+                        and tokens[1] in {"-", "–", "—"}
+                        and tokens[2].isdigit()
+                    ):
+                        labels.add(f"{int(tokens[0])}-{int(tokens[2])}")
+    return labels
+
+
+def unique_section_page_destination(
+    row: TocRow,
+    analyses: Sequence[PageAnalysis],
+    excluded_pages: set[int],
+    *,
+    allowed_pages: set[int],
+) -> tuple[int | None, float, str | None]:
+    """Resolve an exact technical section-page label with title evidence."""
+
+    label = section_page_label(row.printed_label)
+    if label is None:
+        return None, 0.0, None
+
+    title_variants = toc_title_variants(row.title, row.ordinal)
+    scores: list[tuple[float, int]] = []
+    for analysis in analyses:
+        page_index = analysis.page_index
+        if page_index in excluded_pages or page_index not in allowed_pages:
+            continue
+        if label not in visible_section_page_labels(analysis):
+            continue
+        title_score = max(
+            (
+                title_match_score(variant, analysis.normalized_text)
+                for variant in title_variants
+            ),
+            default=0.0,
+        )
+        scores.append((title_score, page_index))
+
+    scores.sort(reverse=True)
+    if len(scores) != 1:
+        return None, scores[0][0] if scores else 0.0, label
+    if scores[0][0] < 0.30:
+        return None, scores[0][0] if scores else 0.0, label
+    return scores[0][1], scores[0][0], label
 
 
 def margin_ocr_region_for_observation(
@@ -1792,9 +2165,36 @@ def resolve_toc_row(
     normalized_pages: Sequence[str],
     toc_pages: set[int],
     visual_margin_confirmations: Mapping[tuple[int, int, str], dict] | None = None,
+    section_page_label_mode: bool = False,
 ) -> tuple[int | None, str | None, str, dict]:
     page_count = len(analyses)
     allowed_content_pages = block_content_pages(block_index, blocks, page_count)
+
+    if section_page_label_mode:
+        section_destination, section_score, section_label = (
+            unique_section_page_destination(
+                row,
+                analyses,
+                toc_pages,
+                allowed_pages=allowed_content_pages,
+            )
+        )
+        if section_destination is not None:
+            return section_destination, "section-page-label", "high", {
+                "block_index": block_index,
+                "section_page_label": section_label,
+                "target_title_score": round(section_score, 4),
+            }
+        if section_label is not None:
+            return None, None, "low", {
+                "reason": (
+                    "technical section-page label has no unique exact footer "
+                    "and title match"
+                ),
+                "section_page_label": section_label,
+                "target_title_score": round(section_score, 4),
+            }
+
     candidates: list[tuple[PaginationSegment, int, bool]] = []
     for segment in segments:
         if (
@@ -1935,6 +2335,28 @@ def resolve_toc_row(
             "block_index": block_index,
             "target_margin_labels": observed,
             "target_title_score": round(score, 4),
+        }
+
+    destination, score = unique_title_only_opener_destination(
+        row.title,
+        analyses,
+        toc_pages,
+        allowed_pages=allowed_content_pages,
+    )
+    if destination is not None:
+        observed = visible_margin_numbers(analyses[destination], row.label_kind)
+        if observed and row.printed_number not in observed:
+            return None, None, "low", {
+                "reason": "title-only opener conflicts with destination page label",
+                "candidate_target_page": destination + 1,
+                "target_margin_labels": observed,
+                "target_title_score": round(score, 4),
+            }
+        return destination, "title-only-opener", "high", {
+            "block_index": block_index,
+            "target_margin_labels": observed,
+            "target_title_score": round(score, 4),
+            "title_only_opener": True,
         }
     return None, None, "low", {"reason": "no safe pagination or unique title match"}
 
@@ -2680,6 +3102,7 @@ def load_link_manifest(
     page_count: int,
     *,
     allow_legacy: bool,
+    allow_confirmed_links: bool = False,
 ) -> tuple[list[AddedLink], dict]:
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2689,11 +3112,44 @@ def load_link_manifest(
         raise ValueError("Link manifest must be an object containing a links array")
     schema_version = data.get("schema_version")
     explicitly_reviewed = data.get("reviewed") is True
+    verified_links_offer = data.get("verified_links_offer")
+    eligible_verified_links_offer = (
+        isinstance(verified_links_offer, Mapping)
+        and verified_links_offer.get("eligible") is True
+        and data.get("status") == "NEEDS_REVIEW"
+    )
+    if allow_confirmed_links and not eligible_verified_links_offer:
+        raise ValueError(
+            "--publish-confirmed-links requires an eligible NEEDS_REVIEW link report"
+        )
+    manifest_links = data["links"]
+    if allow_confirmed_links:
+        if (
+            not isinstance(verified_links_offer, Mapping)
+            or verified_links_offer.get("selection_policy")
+            != VERIFIED_LINKS_SELECTION_POLICY
+        ):
+            raise ValueError(
+                "--publish-confirmed-links requires a current verified-link subset"
+            )
+        subset = verified_links_offer.get("links")
+        subset_sha256 = verified_links_offer.get("subset_sha256")
+        if not isinstance(subset, list) or not subset:
+            raise ValueError(
+                "--publish-confirmed-links requires a non-empty verified-link subset"
+            )
+        if (
+            not isinstance(subset_sha256, str)
+            or canonical_json_sha256(subset) != subset_sha256.casefold()
+        ):
+            raise ValueError("Verified-link subset integrity check failed")
+        manifest_links = subset
     if schema_version == 2:
         if data.get("status") != "PASS" and not explicitly_reviewed:
-            raise ValueError(
-                "A NEEDS_REVIEW manifest must be corrected and marked reviewed=true before replay"
-            )
+            if not (allow_confirmed_links and eligible_verified_links_offer):
+                raise ValueError(
+                    "A NEEDS_REVIEW manifest must be corrected and marked reviewed=true before replay"
+                )
     elif not allow_legacy:
         raise ValueError(
             "Legacy manifests have no enforceable review status; inspect the file and pass "
@@ -2727,7 +3183,7 @@ def load_link_manifest(
     if expected_hash is not None and expected_hash.casefold() != actual_hash:
         raise ValueError(f"Link manifest {hash_field} does not match the input PDF")
     links: list[AddedLink] = []
-    for position, raw in enumerate(data["links"], start=1):
+    for position, raw in enumerate(manifest_links, start=1):
         if not isinstance(raw, dict):
             raise ValueError(f"Manifest link {position} is not an object")
         kind = str(raw.get("kind", ""))
@@ -2753,6 +3209,25 @@ def load_link_manifest(
                 raise ValueError(f"Manifest link {position} has no URI")
             if not supported_uri(uri):
                 raise ValueError(f"Manifest link {position} has an invalid URI")
+        candidate = AddedLink(
+            kind=kind,
+            source_page=source_page,
+            rect=rectangle,
+            target_page=target_page if kind == "internal" else None,
+            uri=uri,
+            label=raw.get("label"),
+            title=raw.get("title"),
+            printed_label=raw.get("printed_label"),
+            printed_number=raw.get("printed_number"),
+            label_kind=raw.get("label_kind"),
+            matched_by=raw.get("matched_by"),
+            confidence=raw.get("confidence"),
+            evidence=raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {},
+        )
+        if allow_confirmed_links and not is_verified_link_candidate(candidate):
+            raise ValueError(
+                f"Verified-link subset item {position} does not meet the selection policy"
+            )
         links.append(
             AddedLink(
                 kind=kind,
@@ -2765,9 +3240,14 @@ def load_link_manifest(
                 printed_label=raw.get("printed_label"),
                 printed_number=raw.get("printed_number"),
                 label_kind=raw.get("label_kind"),
-                matched_by="reviewed-manifest",
+                matched_by=(
+                    "verified-links-only" if allow_confirmed_links else "reviewed-manifest"
+                ),
                 confidence="reviewed",
-                evidence={"manifest": str(manifest_path)},
+                evidence={
+                    "manifest": str(manifest_path),
+                    "verified_links_only": allow_confirmed_links,
+                },
             )
         )
     return links, {
@@ -2780,6 +3260,27 @@ def load_link_manifest(
         "explicitly_reviewed": explicitly_reviewed,
         "legacy_override": schema_version != 2,
         "reviewed_links": len(links),
+        "verified_links_offer": (
+            {
+                "selection_policy": verified_links_offer.get("selection_policy"),
+                "subset_sha256": verified_links_offer.get("subset_sha256"),
+                "unresolved_toc_rows": verified_links_offer.get(
+                    "unresolved_toc_rows", 0
+                ),
+                "suspected_unparsed_toc_rows": verified_links_offer.get(
+                    "suspected_unparsed_toc_rows", 0
+                ),
+                "safe_link_counts": verified_links_offer.get("safe_link_counts", {}),
+                "omitted_candidate_counts": verified_links_offer.get(
+                    "omitted_candidate_counts", {}
+                ),
+                "complete_conversion_blockers": verified_links_offer.get(
+                    "complete_conversion_blockers", []
+                ),
+            }
+            if allow_confirmed_links and isinstance(verified_links_offer, Mapping)
+            else None
+        ),
     }
 
 
@@ -2874,6 +3375,8 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     )
     if reference_path and manifest_path:
         raise ValueError("Use either --reference-pdf or --link-manifest, not both")
+    if args.publish_confirmed_links and not manifest_path:
+        raise ValueError("--publish-confirmed-links requires --link-manifest")
     reject_path_collisions(
         {
             "source": input_path,
@@ -2932,6 +3435,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     unresolved: list[dict] = []
     warnings: list[str] = []
     review_reasons: list[str] = []
+    eligible_verified_links_reasons: list[str] = []
     toc_pages: set[int] = set()
     rows_by_page: dict[int, list[TocRow]] = {}
     headingless_navigation_pages: list[int] = []
@@ -2943,6 +3447,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     completeness_diagnostics: list[dict] = []
     suspected_unparsed_rows = 0
     nontext_visual_pages: list[int] = []
+    navigation_candidate_pages: set[int] = set()
     parsed_toc_rows = 0
     covered_existing_rows = 0
     ocr_summary: OCRSummary | None = None
@@ -2950,6 +3455,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     margin_ocr_summary: MarginOCRSummary | None = None
     margin_ocr_retry_summary: MarginOCRSummary | None = None
     margin_ocr_confirmations: dict[tuple[int, int, str], dict] = {}
+    margin_checks: list[MarginOCRCheck] = []
     preliminary_expected_by_page: dict[int, int] = {}
     covered_replay_links: list[AddedLink] = []
     replay_conflicts: list[dict] = []
@@ -2957,6 +3463,8 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     skipped_bare_domain_candidates = 0
     manifest_input: dict | None = None
     reference_sha256: str | None = None
+    ocr_relevant_failed_pages: list[int] = []
+    ocr_noncritical_failed_pages: list[int] = []
 
     analysis_started = time.perf_counter()
     if reference_path:
@@ -2998,12 +3506,15 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             added.append(link)
             occupied[link.source_page].append(link.rect)
     elif manifest_path:
-        mode = "reviewed-manifest"
+        mode = (
+            "verified-links-only" if args.publish_confirmed_links else "reviewed-manifest"
+        )
         candidates, manifest_input = load_link_manifest(
             manifest_path,
             input_path,
             page_count,
             allow_legacy=args.allow_legacy_manifest,
+            allow_confirmed_links=args.publish_confirmed_links,
         )
         for link in candidates:
             if link.kind == "internal" and args.no_toc_links:
@@ -3047,9 +3558,9 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                         "ocr_pages": selected,
                     },
                 ),
-                on_page_started=lambda completed, total, page_index: emit_progress(
-                    "OCR_PAGES",
-                    completed=min(total, completed + 1),
+            on_page_started=lambda completed, total, page_index: emit_progress(
+                "OCR_PAGES",
+                completed=completed,
                     total=total,
                     unit="page",
                     page=page_index + 1,
@@ -3094,6 +3605,13 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                         and int(item["page"]) not in full_page_ocr_enriched
                         and not has_section_range_layout(
                             analyses[int(item["page"]) - 1].words
+                        )
+                    )
+                    or (
+                        int(item["page"]) not in full_page_ocr_enriched
+                        and toc_page_needs_label_repair_ocr(
+                            analyses[int(item["page"]) - 1],
+                            rows_by_page[int(item["page"]) - 1],
                         )
                     )
                 )
@@ -3321,8 +3839,25 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                         has_xobjects = bool(xobjects)
                     except (AttributeError, KeyError, TypeError, ValueError):
                         has_xobjects = False
-                    if content_bytes >= 4096 or has_xobjects:
-                        nontext_visual_pages.append(page_index)
+                if content_bytes >= 4096 or has_xobjects:
+                    nontext_visual_pages.append(page_index)
+
+            if not args.no_toc_links:
+                # A failed OCR page next to a confirmed contents block can itself be a
+                # scanned continuation page. It has no rows to parse, so it would not
+                # otherwise appear in ``toc_pages``. Keep it a release blocker instead
+                # of mistaking it for unrelated decorative artwork.
+                adjacent_toc_pages = {
+                    candidate_page
+                    for toc_page in toc_pages
+                    for candidate_page in (toc_page - 1, toc_page + 1)
+                    if 0 <= candidate_page < page_count
+                }
+                navigation_candidate_pages = (
+                    adjacent_toc_pages
+                    | set(headingless_navigation_pages)
+                    | set(nontext_visual_pages)
+                )
 
             parsed_toc_rows = sum(len(rows_by_page[page]) for page in toc_pages)
             completeness_diagnostics, suspected_unparsed_rows = toc_completeness_diagnostics(
@@ -3345,6 +3880,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 )
                 warnings.append(message)
                 review_reasons.append(message)
+                eligible_verified_links_reasons.append(message)
             if (
                 headingless_navigation_pages
                 and explicit_toc_pages is None
@@ -3363,6 +3899,9 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             if not args.no_toc_links:
                 planned_row_number = 0
                 for source_page in sorted(toc_pages):
+                    section_page_label_mode = toc_rows_use_section_page_labels(
+                        rows_by_page[source_page]
+                    )
                     for row in rows_by_page[source_page]:
                         planned_row_number += 1
                         emit_progress(
@@ -3392,10 +3931,11 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                                 blocks,
                             pagination_segments,
                             analyses,
-                            normalized_pages,
-                            toc_pages,
-                            visual_margin_confirmations=margin_ocr_confirmations,
-                        )
+                    normalized_pages,
+                    toc_pages,
+                    visual_margin_confirmations=margin_ocr_confirmations,
+                    section_page_label_mode=section_page_label_mode,
+                )
                         if destination is None or destination == source_page:
                             unresolved.append(
                                 {
@@ -3479,9 +4019,30 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             added.append(link)
             occupied[link.source_page].append(link.rect)
 
-        if ocr_summary is not None and ocr_summary.failed_pages:
-            pages = ", ".join(str(page) for page in ocr_summary.failed_pages)
-            message = f"Local OCR could not complete on page(s): {pages}."
+    if ocr_summary is not None and ocr_summary.failed_pages:
+        ocr_relevant_failed_pages, ocr_noncritical_failed_pages = (
+            classify_ocr_failure_relevance(
+                ocr_summary.failed_pages,
+                toc_pages=toc_pages,
+                navigation_ocr_pages=navigation_ocr_pages,
+                navigation_candidate_pages=navigation_candidate_pages,
+                planned_links=added,
+                unresolved_rows=unresolved,
+                margin_checks=margin_checks,
+            )
+        )
+        if ocr_noncritical_failed_pages:
+            pages = ", ".join(str(page) for page in ocr_noncritical_failed_pages)
+            warnings.append(
+                "Local OCR could not complete on unrelated page(s): "
+                f"{pages}. Confirmed links were not affected."
+            )
+        if ocr_relevant_failed_pages:
+            pages = ", ".join(str(page) for page in ocr_relevant_failed_pages)
+            message = (
+                "Local OCR could not complete on page(s) needed to check links: "
+                f"{pages}."
+            )
             warnings.append(message)
             review_reasons.append(message)
         if navigation_ocr_summary is not None and navigation_ocr_summary.failed_pages:
@@ -3556,6 +4117,7 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         message = f"{len(unresolved)} detected TOC rows could not be safely mapped."
         warnings.append(message)
         review_reasons.append(message)
+        eligible_verified_links_reasons.append(message)
     if (
         not args.no_toc_links
         and navigation_rows_without_internal_links(
@@ -3579,6 +4141,53 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     added_counts = Counter(link.kind for link in added)
     predicted_counts = Counter(existing_counts)
     predicted_counts.update(added_counts)
+    unique_review_reasons = list(dict.fromkeys(review_reasons))
+    complete_conversion_blockers = [
+        reason
+        for reason in unique_review_reasons
+        if reason not in eligible_verified_links_reasons
+    ]
+    navigation_ocr_failed_pages = (
+        list(navigation_ocr_summary.failed_pages)
+        if navigation_ocr_summary is not None
+        else []
+    )
+    verified_links = verified_link_subset(
+        added,
+        relevant_ocr_failures=ocr_relevant_failed_pages,
+        navigation_ocr_failures=navigation_ocr_failed_pages,
+    )
+    verified_link_entries = [asdict(link) for link in verified_links]
+    verified_link_counts = Counter(link.kind for link in verified_links)
+    omitted_candidate_counts = Counter(
+        (
+            f"{link.confidence or 'unclassified'}_internal"
+            if link.kind == "internal"
+            else "non-visible_external"
+        )
+        for link in added
+        if link not in verified_links
+    )
+    verified_links_offer = {
+        "eligible": bool(
+            mode == "automatic-analysis"
+            and unique_review_reasons
+            and verified_links
+        ),
+        "selection_policy": VERIFIED_LINKS_SELECTION_POLICY,
+        "links": verified_link_entries,
+        "subset_sha256": canonical_json_sha256(verified_link_entries),
+        "safe_link_counts": dict(verified_link_counts),
+        "omitted_candidate_counts": dict(omitted_candidate_counts),
+        "unresolved_toc_rows": len(unresolved),
+        "suspected_unparsed_toc_rows": suspected_unparsed_rows,
+        "noncritical_ocr_failed_pages": ocr_noncritical_failed_pages,
+        "relevant_ocr_failed_pages": ocr_relevant_failed_pages,
+        "navigation_ocr_failed_pages": navigation_ocr_failed_pages,
+        # These prevent a complete automatic conversion, but do not invalidate
+        # the already-confirmed links preserved by a verified-links-only copy.
+        "complete_conversion_blockers": complete_conversion_blockers,
+    }
     segments_report = [
         {
             **asdict(segment),
@@ -3639,6 +4248,13 @@ def _make_interactive(args: argparse.Namespace) -> dict:
             if ocr_summary is not None
             else {"used": False}
         ),
+        "ocr_failure_relevance": {
+            "relevant_failed_pages": ocr_relevant_failed_pages,
+            "noncritical_failed_pages": ocr_noncritical_failed_pages,
+            "potential_navigation_pages": sorted(
+                page_index + 1 for page_index in navigation_candidate_pages
+            ),
+        },
         "skill_provenance": runtime_provenance,
         "pdf_version": source_pdf_version,
         "pages": page_count,
@@ -3666,13 +4282,42 @@ def _make_interactive(args: argparse.Namespace) -> dict:
         "unresolved_toc_rows": unresolved,
         "skipped_bare_domain_candidates": skipped_bare_domain_candidates,
         "bare_domain_links_enabled": bool(args.allow_bare_domains),
-        "review_reasons": list(dict.fromkeys(review_reasons)),
+        "review_reasons": unique_review_reasons,
+        "verified_links_offer": verified_links_offer,
         "warnings": list(dict.fromkeys(warnings)),
         "reference_pdf_sha256": reference_sha256,
         "manifest_input": manifest_input,
         "timings": timings,
         "links": [asdict(link) for link in added],
     }
+    if args.publish_confirmed_links and manifest_input is not None:
+        source_offer = manifest_input.get("verified_links_offer")
+        report["publication"] = {
+            "mode": "verified-links-only",
+            "strict_result": "NEEDS_REVIEW",
+        "source_report": str(manifest_path) if manifest_path is not None else None,
+        "selection_policy": (
+            source_offer.get("selection_policy")
+            if isinstance(source_offer, Mapping)
+            else None
+        ),
+        "subset_sha256": (
+            source_offer.get("subset_sha256")
+            if isinstance(source_offer, Mapping)
+            else None
+        ),
+        "confirmed_links_replayed": manifest_input.get("reviewed_links", 0),
+        "omitted_toc_rows": (
+                source_offer.get("unresolved_toc_rows", 0)
+                if isinstance(source_offer, Mapping)
+                else 0
+            ),
+            "suspected_unparsed_toc_rows": (
+                source_offer.get("suspected_unparsed_toc_rows", 0)
+                if isinstance(source_offer, Mapping)
+                else 0
+            ),
+        }
     if report_path is not None:
         report["report_json"] = str(report_path)
 
@@ -3841,6 +4486,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--link-manifest",
         help="Reviewed JSON report/manifest whose exact zero-based link mappings should be applied",
+    )
+    parser.add_argument(
+        "--publish-confirmed-links",
+        action="store_true",
+        help=(
+            "Replay only the confirmed links from an eligible NEEDS_REVIEW report; "
+            "unresolved entries remain unchanged"
+        ),
     )
     parser.add_argument(
         "--allow-legacy-manifest",

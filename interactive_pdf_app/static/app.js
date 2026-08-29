@@ -60,6 +60,10 @@
     contentsLinks: document.querySelector("#contentsLinks"),
     webLinks: document.querySelector("#webLinks"),
     reviewReasons: document.querySelector("#reviewReasons"),
+    verifiedLinksOffer: document.querySelector("#verifiedLinksOffer"),
+    verifiedLinksTitle: document.querySelector("#verifiedLinksTitle"),
+    verifiedLinksMessage: document.querySelector("#verifiedLinksMessage"),
+    publishVerifiedLinksButton: document.querySelector("#publishVerifiedLinksButton"),
     failMessage: document.querySelector("#failMessage"),
     downloadPdfButton: document.querySelector("#downloadPdfButton"),
     downloadPassReportButton: document.querySelector("#downloadPassReportButton"),
@@ -851,6 +855,65 @@
     }
   }
 
+  async function publishVerifiedLinks() {
+    if (!state.jobId || state.appClosed) {
+      return;
+    }
+
+    const sequence = ++state.pollSequence;
+    const button = elements.publishVerifiedLinksButton;
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "Preparing verified links...";
+    state.pollingFinished = false;
+    resetProgress();
+    elements.processingMessage.textContent = "Preparing the verified links…";
+    showView(elements.processingView, true);
+
+    try {
+      const response = await apiFetch(
+        `/api/jobs/${encodeURIComponent(state.jobId)}/publish-verified-links`,
+        { method: "POST" },
+      );
+      const payload = await readResponse(response);
+      if (!response.ok) {
+        if (response.status === 409 && sequence === state.pollSequence) {
+          const currentResponse = await apiFetch(
+            `/api/jobs/${encodeURIComponent(state.jobId)}`,
+          );
+          if (currentResponse.ok) {
+            const currentPayload = await readResponse(currentResponse);
+            state.lastPayload = currentPayload;
+            if (handleJobPayload(currentPayload)) {
+              return;
+            }
+            await pollJob(sequence);
+            return;
+          }
+        }
+        throw new Error(getPayloadMessage(payload) || friendlyHttpError(response.status));
+      }
+      if (sequence !== state.pollSequence) {
+        return;
+      }
+      state.lastPayload = payload;
+      if (handleJobPayload(payload)) {
+        return;
+      }
+      await pollJob(sequence);
+    } catch (error) {
+      if (error?.name === "AbortError" || sequence !== state.pollSequence) {
+        return;
+      }
+      showFailure(friendlyError(error));
+    } finally {
+      if (!state.appClosed) {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+    }
+  }
+
   function wakeJobPolling() {
     const resolvers = Array.from(state.pollWakeResolvers);
     state.pollWakeResolvers.clear();
@@ -1023,7 +1086,11 @@
     elements.contentsLinks.textContent = String(counts.contents);
     elements.webLinks.textContent = String(counts.web);
     elements.downloadPassReportButton.hidden = !reportIsAvailable(payload, false);
-    elements.passDownloadMessage.textContent = "";
+    elements.passDownloadMessage.textContent = Boolean(
+      valueFrom(payload, ["partial_result", "publication.mode", "result.partial_result"]),
+    )
+      ? "Only verified links were added; unclear entries were left unchanged."
+      : "";
     showView(elements.passView, true);
   }
 
@@ -1053,6 +1120,33 @@
     return reasons;
   }
 
+  function verifiedLinksOffer(payload) {
+    const available = Boolean(
+      valueFrom(payload, [
+        "verified_links_available",
+        "verified_links_offer.eligible",
+        "result.verified_links_available",
+      ]),
+    );
+    const safeLinks = finiteCount(
+      valueFrom(payload, [
+        "verified_links_safe_links",
+        "verified_links_offer.safe_links",
+        "result.verified_links_safe_links",
+      ]),
+      0,
+    );
+    const unresolvedRows = finiteCount(
+      valueFrom(payload, [
+        "verified_links_unresolved_rows",
+        "verified_links_offer.unresolved_toc_rows",
+        "result.verified_links_unresolved_rows",
+      ]),
+      0,
+    );
+    return { available: available && safeLinks > 0, safeLinks, unresolvedRows };
+  }
+
   function showReview(payload) {
     ++state.pollSequence;
     state.pollingFinished = true;
@@ -1062,6 +1156,16 @@
       item.textContent = reason;
       elements.reviewReasons.append(item);
     });
+    const offer = verifiedLinksOffer(payload);
+    elements.verifiedLinksOffer.hidden = !offer.available;
+    if (offer.available) {
+      elements.verifiedLinksTitle.textContent = offer.safeLinks === 1
+        ? "1 verified link is ready"
+        : `${offer.safeLinks} verified links are ready`;
+      elements.verifiedLinksMessage.textContent = offer.unresolvedRows > 0
+        ? `${offer.unresolvedRows} unclear contents entr${offer.unresolvedRows === 1 ? "y will" : "ies will"} be left unchanged.`
+        : "Only the links we could confirm will be added.";
+    }
     elements.downloadReviewReportButton.hidden = !reportIsAvailable(payload, true);
     elements.reviewDownloadMessage.textContent = "";
     showView(elements.reviewView, true);
@@ -1261,6 +1365,7 @@
   elements.retryButton.addEventListener("click", startJob);
   elements.passStartOverButton.addEventListener("click", startOver);
   elements.reviewStartOverButton.addEventListener("click", startOver);
+  elements.publishVerifiedLinksButton.addEventListener("click", publishVerifiedLinks);
   elements.failStartOverButton.addEventListener("click", startOver);
   elements.downloadPdfButton.addEventListener("click", () =>
     downloadResult("pdf", elements.downloadPdfButton, elements.passDownloadMessage),

@@ -42,14 +42,16 @@ def analysis(
     *,
     normalized_text: str | None = None,
     margin_labels: list[linker.PageLabelObservation] | None = None,
+    width: float = PAGE_WIDTH,
+    height: float = PAGE_HEIGHT,
 ) -> linker.PageAnalysis:
     page_words = list(words or [])
     lines = linker.group_words_into_lines(page_words)
     raw_text = " ".join(str(item["text"]) for row in lines for item in row)
     return linker.PageAnalysis(
         page_index=page_index,
-        width=PAGE_WIDTH,
-        height=PAGE_HEIGHT,
+        width=width,
+        height=height,
         rotation=0,
         image_area_ratio=0.0,
         words=page_words,
@@ -80,6 +82,39 @@ class TocDetectionRegressions(unittest.TestCase):
         toc_pages, _ = linker.detect_toc_pages([analysis(0, toc_words)], None)
 
         self.assertEqual(toc_pages, {0})
+
+    def test_contents_of_volume_heading_is_supported_across_two_lines(self) -> None:
+        toc_words = [
+            word("CONTENTS", 50.0, 30.0),
+            word("OF", 118.0, 30.0),
+            word("VOLUME", 50.0, 48.0),
+            word("II.", 120.0, 48.0),
+            *line(105.0, "Nine Days", "7"),
+            *line(130.0, "Chapter Nineteen", "16"),
+        ]
+
+        toc_pages, _ = linker.detect_toc_pages([analysis(0, toc_words)], None)
+
+        self.assertEqual(toc_pages, {0})
+
+    def test_scanned_contents_with_malformed_labels_requests_narrow_ocr(self) -> None:
+        scanned_page = analysis(0)
+        scanned_page.image_area_ratio = 0.75
+        corrupt_rows = [
+            linker.TocRow(0, "First", "7", 7, "arabic", (10, 10, 100, 30)),
+            linker.TocRow(0, "Second", "9'", 9, "arabic", (10, 40, 100, 60)),
+        ]
+        clean_rows = [
+            linker.TocRow(0, "First", "7", 7, "arabic", (10, 10, 100, 30)),
+            linker.TocRow(0, "Second", "9", 9, "arabic", (10, 40, 100, 60)),
+        ]
+
+        self.assertTrue(
+            linker.toc_page_needs_label_repair_ocr(scanned_page, corrupt_rows)
+        )
+        self.assertFalse(
+            linker.toc_page_needs_label_repair_ocr(scanned_page, clean_rows)
+        )
 
     def test_contents_inside_prose_is_not_a_toc_heading(self) -> None:
         page_words = [
@@ -345,6 +380,260 @@ class LabelCandidateRegressions(unittest.TestCase):
 
 
 class DestinationResolutionRegressions(unittest.TestCase):
+    def test_sparse_title_only_opener_can_resolve_a_damaged_contents_title(self) -> None:
+        analyses = [analysis(index) for index in range(5)]
+        analyses[1] = analysis(
+            1,
+            [
+                word("Stave", 250.0, 305.0),
+                word("One", 300.0, 305.0),
+                word("MARLEY'S", 220.0, 330.0),
+                word("GHOST", 300.0, 330.0),
+            ],
+        )
+        for page_index in (2, 3):
+            analyses[page_index] = analysis(
+                page_index,
+                [
+                    word("MARLEY'S", 50.0, 35.0),
+                    word("GHOST", 130.0, 35.0),
+                    *[
+                        word(f"body{ordinal}", 50.0, 80.0 + ordinal * 14.0)
+                        for ordinal in range(24)
+                    ],
+                ],
+            )
+        row = linker.TocRow(
+            0,
+            "Marlev's Ghost",
+            "7",
+            7,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+
+        destination, matched_by, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+        )
+
+        self.assertEqual(destination, 1)
+        self.assertEqual(matched_by, "title-only-opener")
+        self.assertEqual(confidence, "high")
+        self.assertTrue(evidence["title_only_opener"])
+
+    def test_title_only_opener_requires_one_unambiguous_candidate(self) -> None:
+        analyses = [analysis(index) for index in range(4)]
+        for page_index in (1, 2):
+            analyses[page_index] = analysis(
+                page_index,
+                [word("UNIQUE", 220.0, 330.0), word("CHAPTER", 285.0, 330.0)],
+            )
+        row = linker.TocRow(
+            0,
+            "Unique Chapter",
+            "7",
+            7,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+
+        destination, matched_by, confidence, _ = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+        )
+
+        self.assertIsNone(destination)
+        self.assertIsNone(matched_by)
+        self.assertEqual(confidence, "low")
+
+    def test_section_page_label_resolves_restarted_technical_pagination(self) -> None:
+        analyses = [analysis(index) for index in range(4)]
+        analyses[1] = analysis(
+            1,
+            [
+                word("MISSION", 50.0, 40.0),
+                word("SUMMARY", 110.0, 40.0),
+                word("FLIGHT", 180.0, 40.0),
+                word("PLAN", 230.0, 40.0),
+                word("1", 285.0, 760.0),
+                word("-", 301.0, 760.0),
+                word("5", 315.0, 760.0),
+            ],
+        )
+        analyses[2] = analysis(
+            2,
+            [
+                word("MISSION", 50.0, 40.0),
+                word("SUMMARY", 110.0, 40.0),
+                word("FLIGHT", 180.0, 40.0),
+                word("PLAN", 230.0, 40.0),
+                word("1", 285.0, 760.0),
+                word("-", 301.0, 760.0),
+                word("6", 315.0, 760.0),
+            ],
+        )
+        row = linker.TocRow(
+            0,
+            "Summary Flight Plan",
+            "1-5",
+            1,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+
+        destination, matched_by, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            section_page_label_mode=True,
+        )
+
+        self.assertEqual(destination, 1)
+        self.assertEqual(matched_by, "section-page-label")
+        self.assertEqual(confidence, "high")
+        self.assertEqual(evidence["section_page_label"], "1-5")
+
+    def test_unmatched_section_page_label_cannot_fall_back_to_plain_page_number(self) -> None:
+        analyses = [analysis(index) for index in range(4)]
+        row = linker.TocRow(
+            0,
+            "Summary Flight Plan",
+            "1-5",
+            1,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+        segment = linker.PaginationSegment(
+            block_index=0,
+            label_kind="arabic",
+            printed_start=1,
+            printed_end=4,
+            offset=1,
+            evidence_pages=3,
+            density=1.0,
+        )
+
+        destination, matched_by, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [segment],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            section_page_label_mode=True,
+        )
+
+        self.assertIsNone(destination)
+        self.assertIsNone(matched_by)
+        self.assertEqual(confidence, "low")
+        self.assertIn("technical section-page label", evidence["reason"])
+
+    def test_duplicate_section_page_label_stays_unresolved(self) -> None:
+        analyses = [analysis(index) for index in range(4)]
+        for page_index in (1, 2):
+            analyses[page_index] = analysis(
+                page_index,
+                [
+                    word("SUMMARY", 50.0, 40.0),
+                    word("FLIGHT", 120.0, 40.0),
+                    word("PLAN", 190.0, 40.0),
+                    word("1", 285.0, 760.0),
+                    word("-", 301.0, 760.0),
+                    word("5", 315.0, 760.0),
+                ],
+            )
+        row = linker.TocRow(
+            0,
+            "Summary Flight Plan",
+            "1-5",
+            1,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+
+        destination, matched_by, confidence, _ = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            section_page_label_mode=True,
+        )
+
+        self.assertIsNone(destination)
+        self.assertIsNone(matched_by)
+        self.assertEqual(confidence, "low")
+
+    def test_unique_section_page_label_allows_imperfect_technical_title(self) -> None:
+        analyses = [analysis(index) for index in range(3)]
+        analyses[1] = analysis(
+            1,
+            [
+                word("SUMMARY", 50.0, 40.0),
+                word("1", 285.0, 760.0),
+                word("-", 301.0, 760.0),
+                word("5", 315.0, 760.0),
+            ],
+        )
+        row = linker.TocRow(
+            0,
+            "Summary Flight Plan",
+            "1-5",
+            1,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+
+        destination, matched_by, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [],
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            section_page_label_mode=True,
+        )
+
+        self.assertEqual(destination, 1)
+        self.assertEqual(matched_by, "section-page-label")
+        self.assertEqual(confidence, "high")
+        self.assertGreaterEqual(evidence["target_title_score"], 0.30)
+
+    def test_landscape_outer_edge_section_label_is_detected(self) -> None:
+        landscape = analysis(
+            1,
+            [
+                word("1", 36.0, 288.0),
+                word("-", 36.0, 302.0),
+                word("5", 36.0, 316.0),
+                word("MCC4", 790.0, 288.0),
+                word("-22", 790.0, 302.0),
+            ],
+            width=842.0,
+            height=595.0,
+        )
+
+        self.assertEqual(linker.visible_section_page_labels(landscape), {"1-5"})
+
     def test_margin_ocr_numbers_require_high_confidence_standalone_labels(
         self,
     ) -> None:

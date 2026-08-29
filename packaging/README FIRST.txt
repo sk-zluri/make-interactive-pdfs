@@ -1,4 +1,4 @@
-MAKE INTERACTIVE PDFS - PORTABLE WINDOWS BUILD 1.3.5
+MAKE INTERACTIVE PDFS - PORTABLE WINDOWS BUILD 1.3.6
 
 1. Keep the entire folder together.
 2. Double-click "Make Interactive PDFs.exe".

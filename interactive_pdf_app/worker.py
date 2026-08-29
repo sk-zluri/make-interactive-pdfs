@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Sequence
 
 
-_COMMAND_MODULES = {"make": "make_interactive_pdf", "verify": "verify_interactive_pdf"}
+_COMMAND_MODULES = {
+    "make": "make_interactive_pdf",
+    "make-verified": "make_interactive_pdf",
+    "verify": "verify_interactive_pdf",
+}
 _INHERITED_DEVELOPMENT_VARIABLES = (
     "MAKE_INTERACTIVE_PDFS_ADVERTISED_HEAD",
     "MAKE_INTERACTIVE_PDFS_EXPECTED_COMMIT",
@@ -77,7 +81,7 @@ def run_internal_worker(arguments: Sequence[str]) -> int:
     output_path = job_directory / "interactive.pdf"
     report_path = job_directory / "link-report.json"
     verification_path = job_directory / "verification.json"
-    if command == "make":
+    if command in {"make", "make-verified"}:
         engine_arguments = (
             str(source_path),
             "--output",
@@ -85,6 +89,18 @@ def run_internal_worker(arguments: Sequence[str]) -> int:
             "--report-json",
             str(report_path),
         )
+        if command == "make-verified":
+            engine_arguments = (
+                str(source_path),
+                "--link-manifest",
+                str(job_directory / "review-source.json"),
+                "--publish-confirmed-links",
+                "--output",
+                str(output_path),
+                "--report-json",
+                str(report_path),
+                "--force",
+            )
     else:
         engine_arguments = (
             str(source_path),

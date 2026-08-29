@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -147,6 +148,16 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _sha256_file(path: Path) -> str:
+    """Return a stable digest for an app-owned replay manifest."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _read_log_tail(path: Path, limit: int = 64 * 1024) -> str:
     try:
         with path.open("rb") as handle:
@@ -198,9 +209,11 @@ class Job:
     source_path: Path
     output_path: Path
     report_path: Path
+    review_source_path: Path
     verification_path: Path
     output_filename: str
     report_filename: str
+    review_source_sha256: str | None = None
     status: JobStatus = JobStatus.UPLOADING
     stage: str = "UPLOADING"
     progress: int = 2
@@ -208,6 +221,12 @@ class Job:
     size_bytes: int = 0
     reasons: list[str] = field(default_factory=list)
     link_counts: dict[str, int] = field(default_factory=dict)
+    verified_links_available: bool = False
+    verified_links_safe_links: int = 0
+    verified_links_unresolved_rows: int = 0
+    verified_links_message: str | None = None
+    replaying_verified_links: bool = False
+    partial_result: bool = False
     progress_sequence: int = 0
     activity: ProgressActivity = field(default_factory=ProgressActivity)
     error: ErrorPayload | None = None
@@ -266,6 +285,7 @@ class JobManager:
                 source_path=job_directory / "source.pdf",
                 output_path=job_directory / "interactive.pdf",
                 report_path=job_directory / "link-report.json",
+                review_source_path=job_directory / "review-source.json",
                 verification_path=job_directory / "verification.json",
                 output_filename=output_filename,
                 report_filename=report_filename,
@@ -296,6 +316,69 @@ class JobManager:
             job.progress = 8
             job.message = "PDF received. Starting…"
             job.updated_at = _utc_now()
+            job.task = asyncio.create_task(self._process_job(job), name=f"pdf-job-{job.id}")
+            return self._view(job)
+
+    async def publish_verified_links(self, job_id: str) -> JobView:
+        """Replay only the confirmed links from an eligible review report."""
+
+        async with self._guard:
+            if self._closing:
+                raise AppError(
+                    503,
+                    ErrorCode.ENGINE_UNAVAILABLE,
+                    "The app is shutting down. Please reopen it and try again.",
+                )
+            job = self._require_job(job_id)
+            if (
+                job.status != JobStatus.NEEDS_REVIEW
+                or not job.verified_links_available
+                or not job.source_path.is_file()
+                or not job.review_source_path.is_file()
+                or not job.review_source_sha256
+            ):
+                raise AppError(
+                    409,
+                    ErrorCode.VERIFIED_LINKS_NOT_AVAILABLE,
+                    "Verified links are no longer available. Please process the PDF again.",
+                )
+
+            expected_manifest_hash = job.review_source_sha256
+            try:
+                actual_manifest_hash = await asyncio.to_thread(
+                    _sha256_file, job.review_source_path
+                )
+            except OSError:
+                actual_manifest_hash = None
+            if actual_manifest_hash != expected_manifest_hash:
+                job.verified_links_available = False
+                job.verified_links_safe_links = 0
+                job.verified_links_unresolved_rows = 0
+                job.verified_links_message = None
+                job.review_source_sha256 = None
+                job.updated_at = _utc_now()
+                raise AppError(
+                    409,
+                    ErrorCode.VERIFIED_LINKS_NOT_AVAILABLE,
+                    "The saved verified-links check changed, so the option was removed.",
+                )
+
+            if self._active_job_id is not None:
+                raise AppError(
+                    409,
+                    ErrorCode.APP_BUSY,
+                    "Another PDF is being processed. Please wait for it to finish.",
+                )
+            job.status = JobStatus.QUEUED
+            job.stage = "PREFLIGHT"
+            job.progress = 8
+            job.message = "Creating a copy with only verified links…"
+            job.error = None
+            job.cancel_requested = False
+            job.replaying_verified_links = True
+            job.partial_result = False
+            job.updated_at = _utc_now()
+            self._active_job_id = job.id
             job.task = asyncio.create_task(self._process_job(job), name=f"pdf-job-{job.id}")
             return self._view(job)
 
@@ -431,6 +514,11 @@ class JobManager:
             report_ready=report_ready,
             pdf_available=pdf_ready,
             report_available=report_ready,
+            verified_links_available=job.verified_links_available,
+            verified_links_safe_links=job.verified_links_safe_links,
+            verified_links_unresolved_rows=job.verified_links_unresolved_rows,
+            verified_links_message=job.verified_links_message,
+            partial_result=job.partial_result,
             error=job.error,
             created_at=job.created_at,
             updated_at=job.updated_at,
@@ -456,24 +544,64 @@ class JobManager:
 
     async def _process_job(self, job: Job) -> None:
         try:
+            if job.replaying_verified_links:
+                try:
+                    manifest_hash = await asyncio.to_thread(
+                        _sha256_file,
+                        job.review_source_path,
+                    )
+                except OSError:
+                    manifest_hash = None
+                if manifest_hash != job.review_source_sha256:
+                    await self._finish_failed(
+                        job,
+                        ErrorPayload(
+                            code=ErrorCode.VERIFIED_LINKS_NOT_AVAILABLE,
+                            message=(
+                                "The saved verified-links check changed before it could "
+                                "be used. Please process the PDF again."
+                            ),
+                        ),
+                    )
+                    return
+
+            make_phase = "make-verified" if job.replaying_verified_links else "make"
+            make_arguments: tuple[str, ...] = (
+                "make",
+                str(job.source_path),
+                "--output",
+                str(job.output_path),
+                "--report-json",
+                str(job.report_path),
+            )
+            if job.replaying_verified_links:
+                make_arguments = (
+                    "make",
+                    str(job.source_path),
+                    "--link-manifest",
+                    str(job.review_source_path),
+                    "--publish-confirmed-links",
+                    "--output",
+                    str(job.output_path),
+                    "--report-json",
+                    str(job.report_path),
+                    "--force",
+                )
             await self._update(
                 job,
                 status=JobStatus.PROCESSING,
                 stage="ANALYZING",
                 progress=18,
-                message="Finding links and page destinations…",
+                message=(
+                    "Preparing the verified links…"
+                    if job.replaying_verified_links
+                    else "Finding links and page destinations…"
+                ),
             )
             make_return_code, make_log = await self._run_engine(
                 job,
-                "make",
-                (
-                    "make",
-                    str(job.source_path),
-                    "--output",
-                    str(job.output_path),
-                    "--report-json",
-                    str(job.report_path),
-                ),
+                make_phase,
+                make_arguments,
             )
             if job.cancel_requested:
                 await self._finish_cancelled(job)
@@ -497,14 +625,41 @@ class JobManager:
             self._apply_report(job, report)
             report_status = report.get("status")
             if report_status == JobStatus.NEEDS_REVIEW.value and make_return_code == 2:
+                if job.verified_links_available:
+                    await asyncio.to_thread(
+                        shutil.copy2,
+                        job.report_path,
+                        job.review_source_path,
+                    )
+                    job.review_source_sha256 = await asyncio.to_thread(
+                        _sha256_file,
+                        job.review_source_path,
+                    )
+                else:
+                    job.review_source_sha256 = None
+                await self._remove_intermediates(
+                    job,
+                    keep_source=job.verified_links_available,
+                    keep_output=False,
+                    keep_report=True,
+                    keep_review_source=job.verified_links_available,
+                )
+                # The browser must not see the review action until the worker
+                # has fully released its single processing slot.
+                async with self._guard:
+                    if self._active_job_id == job.id:
+                        self._active_job_id = None
                 await self._update(
                     job,
                     status=JobStatus.NEEDS_REVIEW,
                     stage="COMPLETE",
                     progress=100,
-                    message="This PDF needs review before safe links can be published.",
+                    message=(
+                        "Verified links are ready if you want a partial copy."
+                        if job.verified_links_available
+                        else "This PDF needs review before safe links can be published."
+                    ),
                 )
-                await self._remove_intermediates(job, keep_output=False, keep_report=True)
                 return
 
             if (
@@ -552,9 +707,19 @@ class JobManager:
                 status=JobStatus.PASS,
                 stage="COMPLETE",
                 progress=100,
-                message="Your verified interactive PDF is ready.",
+                message=(
+                    "Your verified-links copy is ready. Unclear entries were left unchanged."
+                    if job.partial_result
+                    else "Your verified interactive PDF is ready."
+                ),
             )
-            await self._remove_intermediates(job, keep_output=True, keep_report=True)
+            await self._remove_intermediates(
+                job,
+                keep_source=False,
+                keep_output=True,
+                keep_report=True,
+                keep_review_source=False,
+            )
         except EngineTimeoutError:
             await self._finish_failed(
                 job,
@@ -604,6 +769,39 @@ class JobManager:
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     counts[key] = value
         job.link_counts = counts
+
+        offer = report.get("verified_links_offer")
+        if isinstance(offer, dict) and offer.get("eligible") is True:
+            safe_counts = offer.get("safe_link_counts")
+            safe_total = 0
+            if isinstance(safe_counts, dict):
+                for value in safe_counts.values():
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                        safe_total += value
+            unresolved_rows = offer.get("unresolved_toc_rows", 0)
+            job.verified_links_available = safe_total > 0
+            job.verified_links_safe_links = safe_total
+            job.verified_links_unresolved_rows = (
+                unresolved_rows
+                if isinstance(unresolved_rows, int)
+                and not isinstance(unresolved_rows, bool)
+                and unresolved_rows >= 0
+                else 0
+            )
+            job.verified_links_message = (
+                f"{safe_total} verified link{'s' if safe_total != 1 else ''} can be created."
+            )
+        else:
+            job.verified_links_available = False
+            job.verified_links_safe_links = 0
+            job.verified_links_unresolved_rows = 0
+            job.verified_links_message = None
+
+        publication = report.get("publication")
+        job.partial_result = (
+            isinstance(publication, dict)
+            and publication.get("mode") == "verified-links-only"
+        )
 
     async def _apply_progress_event(self, job: Job, event: dict[str, Any]) -> None:
         if event.get("schema_version") != 1:
@@ -813,14 +1011,22 @@ class JobManager:
         self,
         job: Job,
         *,
+        keep_source: bool,
         keep_output: bool,
         keep_report: bool,
+        keep_review_source: bool,
     ) -> None:
-        retained = {job.output_path if keep_output else None, job.report_path if keep_report else None}
+        retained = {
+            job.source_path if keep_source else None,
+            job.output_path if keep_output else None,
+            job.report_path if keep_report else None,
+            job.review_source_path if keep_review_source else None,
+        }
         candidates = (
             job.source_path,
             job.output_path,
             job.report_path,
+            job.review_source_path,
             job.verification_path,
             job.directory / "make.log",
             job.directory / "verify.log",

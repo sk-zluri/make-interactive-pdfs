@@ -839,6 +839,32 @@ h1 {
   text-align: center;
 }
 
+.verified-links-offer {
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface-accent);
+}
+
+.verified-links-offer strong {
+  display: block;
+  color: var(--text);
+}
+
+.verified-links-offer p {
+  margin: 8px 0 14px;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.verified-links-offer .verified-links-privacy {
+  margin: 12px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .view:not([hidden]) {
     animation: view-enter 220ms var(--ease) both;

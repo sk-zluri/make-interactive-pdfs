@@ -46,6 +46,7 @@ class ErrorCode(str, Enum):
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     UPLOAD_FAILED = "UPLOAD_FAILED"
     DOWNLOAD_NOT_AVAILABLE = "DOWNLOAD_NOT_AVAILABLE"
+    VERIFIED_LINKS_NOT_AVAILABLE = "VERIFIED_LINKS_NOT_AVAILABLE"
     PASSWORD_REQUIRED = "PASSWORD_REQUIRED"
     SIGNED_PDF = "SIGNED_PDF"
     ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
@@ -100,6 +101,11 @@ class JobView(BaseModel):
     # Compatibility aliases used by the first browser UI.
     pdf_available: bool = False
     report_available: bool = False
+    verified_links_available: bool = False
+    verified_links_safe_links: int = Field(default=0, ge=0)
+    verified_links_unresolved_rows: int = Field(default=0, ge=0)
+    verified_links_message: str | None = None
+    partial_result: bool = False
     error: ErrorPayload | None = None
     created_at: str
     updated_at: str

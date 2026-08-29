@@ -20,7 +20,7 @@ import uvicorn
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from interactive_pdf_app import jobs
+from interactive_pdf_app import jobs, worker
 from interactive_pdf_app.__main__ import BrowserSessionMonitor
 from interactive_pdf_app.jobs import EngineTimeoutError, JobManager, _safe_rmtree
 from interactive_pdf_app.models import AppError, ErrorCode, ErrorPayload, JobStatus
@@ -323,6 +323,109 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output, job.output_path)
         self.assertEqual(report, job.report_path)
 
+    async def test_verified_links_replay_is_rejected_while_shutting_down(self) -> None:
+        self.manager._closing = True  # noqa: SLF001 - lifecycle boundary test
+
+        with self.assertRaises(AppError) as raised:
+            await self.manager.publish_verified_links("missing-job")
+
+        self.assertEqual(raised.exception.http_status, 503)
+        self.assertEqual(raised.exception.payload.code, ErrorCode.ENGINE_UNAVAILABLE)
+
+    async def test_verified_links_replay_keeps_source_only_for_eligible_review(self) -> None:
+        job = await self.manager.reserve_upload("review.pdf")
+        job.source_path.write_bytes(b"%PDF-1.4\nprivate test data")
+        job.report_path.write_text('{"status":"NEEDS_REVIEW"}', encoding="utf-8")
+        job.review_source_path.write_text('{"verified_links_offer":{"eligible":true}}', encoding="utf-8")
+        job.status = JobStatus.NEEDS_REVIEW
+        job.verified_links_available = True
+        job.verified_links_safe_links = 3
+        job.review_source_sha256 = jobs._sha256_file(job.review_source_path)  # noqa: SLF001
+        self.manager._active_job_id = None  # noqa: SLF001 - completed-review state fixture
+
+        async def no_processing(_: object) -> None:
+            return None
+
+        self.manager._process_job = no_processing  # type: ignore[method-assign]  # noqa: SLF001
+        view = await self.manager.publish_verified_links(job.id)
+        self.assertEqual(view.status, JobStatus.QUEUED)
+        self.assertTrue(job.replaying_verified_links)
+        self.assertIsNotNone(job.task)
+        await job.task
+
+        await self.manager._remove_intermediates(  # noqa: SLF001 - lifecycle boundary test
+            job,
+            keep_source=True,
+            keep_output=False,
+            keep_report=True,
+            keep_review_source=True,
+        )
+        self.assertTrue(job.source_path.is_file())
+        self.assertTrue(job.report_path.is_file())
+        self.assertTrue(job.review_source_path.is_file())
+        self.assertFalse(job.output_path.exists())
+
+        job.status = JobStatus.NEEDS_REVIEW
+        self.manager._active_job_id = None  # noqa: SLF001 - completed-review state fixture
+        await self.manager.cleanup(job.id)
+        self.assertFalse(job.directory.exists())
+
+    async def test_verified_links_replay_rejects_tampered_review_source(self) -> None:
+        job = await self.manager.reserve_upload("review-tampered.pdf")
+        job.source_path.write_bytes(b"%PDF-1.4\nprivate test data")
+        job.review_source_path.write_text(
+            '{"verified_links_offer":{"eligible":true}}', encoding="utf-8"
+        )
+        job.status = JobStatus.NEEDS_REVIEW
+        job.verified_links_available = True
+        job.verified_links_safe_links = 1
+        job.review_source_sha256 = jobs._sha256_file(job.review_source_path)  # noqa: SLF001
+        self.manager._active_job_id = None  # noqa: SLF001 - completed-review state fixture
+
+        job.review_source_path.write_text(
+            '{"verified_links_offer":{"eligible":false}}', encoding="utf-8"
+        )
+
+        with self.assertRaises(AppError) as raised:
+            await self.manager.publish_verified_links(job.id)
+
+        self.assertEqual(
+            raised.exception.payload.code,
+            ErrorCode.VERIFIED_LINKS_NOT_AVAILABLE,
+        )
+        self.assertFalse(job.verified_links_available)
+        self.assertIsNone(job.review_source_sha256)
+        self.assertFalse(job.replaying_verified_links)
+
+    async def test_verified_links_replay_rechecks_manifest_before_running(self) -> None:
+        job = await self.manager.reserve_upload("review-worker-tampered.pdf")
+        job.review_source_path.write_text(
+            '{"verified_links_offer":{"eligible":true}}',
+            encoding="utf-8",
+        )
+        job.review_source_sha256 = jobs._sha256_file(job.review_source_path)  # noqa: SLF001
+        job.replaying_verified_links = True
+        job.review_source_path.write_text(
+            '{"verified_links_offer":{"eligible":false}}',
+            encoding="utf-8",
+        )
+
+        engine_called = False
+
+        async def engine_must_not_run(*_: object) -> tuple[int, str]:
+            nonlocal engine_called
+            engine_called = True
+            return 1, "unexpected"
+
+        self.manager._run_engine = engine_must_not_run  # type: ignore[method-assign]  # noqa: SLF001
+        await self.manager._process_job(job)  # noqa: SLF001 - worker boundary test
+
+        view = await self.manager.get(job.id)
+        self.assertFalse(engine_called)
+        self.assertEqual(view.status, JobStatus.FAIL)
+        self.assertEqual(view.error.code, ErrorCode.VERIFIED_LINKS_NOT_AVAILABLE)
+        self.assertFalse(job.directory.exists())
+
 
 class ProgressTelemetryTests(unittest.TestCase):
     def test_emit_progress_ignores_unwritable_telemetry_file(self) -> None:
@@ -375,6 +478,35 @@ class FilesystemSafetyTests(unittest.TestCase):
                 with patch.object(sys, "frozen", True, create=True):
                     with self.assertRaises(RuntimeError):
                         run_internal_worker(("make", str(job), "--force"))
+
+    def test_packaged_worker_uses_internal_review_source_for_verified_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp) / "owned"
+            job = root / "job"
+            job.mkdir(parents=True)
+            observed: dict[str, list[str]] = {}
+
+            class FakeEngine:
+                @staticmethod
+                def main() -> int:
+                    observed["argv"] = list(sys.argv)
+                    return 0
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"MAKE_INTERACTIVE_PDFS_JOB_ROOT": str(root)},
+                    clear=False,
+                ),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(worker.importlib, "import_module", return_value=FakeEngine()),
+            ):
+                self.assertEqual(run_internal_worker(("make-verified", str(job))), 0)
+
+            arguments = observed["argv"]
+            self.assertIn("--publish-confirmed-links", arguments)
+            self.assertIn(str(job / "review-source.json"), arguments)
+            self.assertIn("--force", arguments)
 
 
 if __name__ == "__main__":

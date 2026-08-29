@@ -298,6 +298,14 @@ def create_app(
     async def cancel_job(job_id: str) -> JobView:
         return await manager.request_cancel(job_id)
 
+    @app.post(
+        "/api/jobs/{job_id}/publish-verified-links",
+        response_model=JobView,
+        status_code=202,
+    )
+    async def publish_verified_links(job_id: str) -> JobView:
+        return await manager.publish_verified_links(job_id)
+
     @app.delete("/api/jobs/{job_id}")
     async def delete_job(job_id: str) -> Response:
         # DELETE doubles as the simple UI's cancellation gesture while active;

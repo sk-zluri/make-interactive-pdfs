@@ -20,7 +20,7 @@ It can add:
 ## Download for Windows
 
 1. Open the [latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest).
-2. Download `Make.Interactive.PDFs.v1.3.5.zip`.
+2. Download `Make.Interactive.PDFs.zip`.
 3. Extract the entire ZIP folder.
 4. Double-click `Make Interactive PDFs.exe`.
 5. Keep the small desktop controller open while using the workspace in Chrome.
@@ -46,7 +46,7 @@ Your PDF is processed locally. It is not uploaded to a cloud service.
 
 ## Smart, selective OCR
 
-The app uses a PDF's existing selectable text whenever that text is healthy, even when a scanned image sits behind it. Local OCR runs only on pages where text is missing or unusable. Blank pages are skipped.
+The app uses a PDF's existing selectable text whenever that text is healthy, even when a scanned image sits behind it. Local OCR runs only on pages where text is missing or unusable, plus a small targeted margin check when a page number needs confirming. Blank pages are skipped.
 
 OCR helps the app understand a page and position links. It does not redraw the page or turn every scanned word into selectable text.
 
@@ -65,7 +65,7 @@ It does not add form fields, audio, video, or other rich-media features.
 - Processes one PDF at a time, up to 512 MB
 - Does not modify password-protected PDFs
 - Does not modify digitally signed PDFs, because editing would invalidate the signature
-- Returns a review report instead of publishing questionable links when a document is too ambiguous
+- If some entries are unclear, the app offers **Create with verified links**. It makes a separate copy containing only links the app can confirm; unclear entries are left untouched, and the added links are verified before download.
 - Ships as an unsigned portable Windows app rather than an installer
 
 ## Run from source
