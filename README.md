@@ -1,57 +1,72 @@
 <p align="center">
-  <img src="interactive_pdf_app/static/app-icon.png" alt="Make Interactive PDFs" width="88">
+  <a href="https://sk-zluri.github.io/make-interactive-pdfs/">
+    <img src="docs/assets/social-preview.png" alt="Make Interactive PDFs: make your PDF clickable, privately" width="1200">
+  </a>
 </p>
 
 # Make Interactive PDFs
 
-Turn static and scanned PDFs into clickable PDFs—privately, on your own computer.
+Make Interactive PDFs is a free, open-source Windows utility that adds useful links to PDFs while keeping the files on your computer.
 
-Make Interactive PDFs can add:
+It can add:
 
 - Page jumps from tables of contents, agendas, indexes, and similar page-reference lists
 - Clickable web addresses and email addresses
 - Local OCR for scanned pages that genuinely need it
-- A verified, separate output PDF without altering the original
+- A verified, separate output PDF without changing the original
+
+**[Visit the website](https://sk-zluri.github.io/make-interactive-pdfs/)** · **[Download the latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest)** · **[Report an issue](https://github.com/sk-zluri/make-interactive-pdfs/issues)**
 
 ## Download for Windows
 
-[Download the latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest)
-
-1. Download `Make.Interactive.PDFs.v1.3.4.zip`.
-2. Extract the entire ZIP to a folder.
-3. Double-click `Make Interactive PDFs.exe`.
-4. Keep the small desktop window open while using the workspace in Chrome.
-5. Choose a PDF and select **Make interactive**.
+1. Open the [latest release](https://github.com/sk-zluri/make-interactive-pdfs/releases/latest).
+2. Download `Make.Interactive.PDFs.v1.3.4.zip`.
+3. Extract the entire ZIP folder.
+4. Double-click `Make Interactive PDFs.exe`.
+5. Keep the small desktop controller open while using the workspace in Chrome.
 
 The app is not code-signed yet, so Windows may show a SmartScreen warning. Only continue if you downloaded it from this repository's official Releases page.
+
+## See it working
+
+<p align="center">
+  <img src="docs/assets/workspace-processing.png" alt="Make Interactive PDFs processing a document page by page" width="960">
+</p>
+
+The progress view shows what the app is checking, which page it is reading, and when OCR is actually needed.
 
 ## Private by design
 
 Your PDF is processed locally. It is not uploaded to a cloud service.
 
-The original file stays untouched. The app creates a separate copy, verifies its links, and only then makes it available for download. Temporary files are removed when you start another PDF or close the app.
+- No account or sign-up
+- The original PDF stays untouched
+- The finished PDF is saved as a separate copy
+- Temporary working files are removed locally
 
 ## Smart, selective OCR
 
-The app uses a PDF's existing selectable text whenever that text is healthy—even when a scanned image sits behind it.
+The app uses a PDF's existing selectable text whenever that text is healthy, even when a scanned image sits behind it. Local OCR runs only on pages where text is missing or unusable. Blank pages are skipped.
 
-Local OCR runs only on pages where text is missing or unusable. Blank pages are skipped. OCR is used to understand the page and place links; it does not redraw the page or replace its visual design.
+OCR helps the app understand a page and position links. It does not redraw the page or turn every scanned word into selectable text.
 
-## When the app is uncertain
+## What “interactive” means here
 
-Some PDFs have ambiguous page numbering, damaged text, unusual layouts, or scans that are difficult to read. In these cases, the app returns a review report instead of publishing a PDF that may contain incorrect links.
+This project currently adds:
 
-## Current scope and limitations
+- Internal page-jump links
+- Clickable web links
+- Clickable email links
 
-In this project, “interactive” currently means internal page-jump links plus clickable web and email addresses. It does not add form fields, audio, video, or other rich-media features.
+It does not add form fields, audio, video, or other rich-media features.
 
-The Windows app currently:
+## Safeguards and current limits
 
 - Processes one PDF at a time, up to 512 MB
 - Does not modify password-protected PDFs
-- Does not modify digitally signed PDFs, because doing so would invalidate the signature
-- May request review for complex contents pages, poor scans, or unclear page references
-- Is distributed as an unsigned folder-based app rather than an installer
+- Does not modify digitally signed PDFs, because editing would invalidate the signature
+- Returns a review report instead of publishing questionable links when a document is too ambiguous
+- Ships as an unsigned portable Windows app rather than an installer
 
 ## Run from source
 
@@ -74,9 +89,9 @@ py -3.11 scripts\run_isolated.py self-test
 .\.venv\Scripts\python.exe scripts\run_isolated.py --venv-dir .venv regression-test
 ```
 
-## License
+## Licence
 
-This project is licensed under the [MIT License](LICENSE). Bundled third-party components remain under their respective licenses.
+The project source is available under the [MIT Licence](LICENSE). Bundled third-party components retain their respective licences; see [Third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Creator
 

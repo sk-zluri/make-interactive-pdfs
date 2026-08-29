@@ -1,0 +1,16 @@
+{
+  "name": "Make Interactive PDFs",
+  "short_name": "Interactive PDFs",
+  "description": "A free local Windows utility for adding page jumps and visible links to PDFs.",
+  "start_url": "./",
+  "display": "browser",
+  "background_color": "#0f1613",
+  "theme_color": "#0f1613",
+  "icons": [
+    {
+      "src": "./assets/app-icon-square.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

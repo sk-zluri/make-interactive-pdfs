@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://sk-zluri.github.io/make-interactive-pdfs/sitemap.xml
