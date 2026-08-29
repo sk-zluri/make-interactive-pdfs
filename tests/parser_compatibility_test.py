@@ -345,18 +345,15 @@ class LabelCandidateRegressions(unittest.TestCase):
 
 
 class DestinationResolutionRegressions(unittest.TestCase):
-    def test_ocr_like_chapter_and_section_ordinals_are_confirmed(self) -> None:
-        self.assertTrue(
-            linker.page_has_chapter_heading(
-                "the ramayana chapter i3 kaikeyi disregards the king",
-                13,
-            )
-        )
-        self.assertTrue(
-            linker.page_has_chapter_heading(
-                "section ccx rajya labha parva",
-                210,
-            )
+    def test_margin_ocr_numbers_require_high_confidence_standalone_labels(
+        self,
+    ) -> None:
+        self.assertEqual(linker.ocr_margin_numbers([("120", 0.95)], "arabic"), {120})
+        self.assertEqual(linker.ocr_margin_numbers([("120", 0.89)], "arabic"), set())
+        self.assertEqual(linker.ocr_margin_numbers([("is", 1.0)], "arabic"), set())
+        self.assertEqual(
+            linker.ocr_margin_numbers([("120", 0.99), ("121", 0.99)], "arabic"),
+            {120, 121},
         )
 
     def test_segment_prediction_cannot_ignore_a_visible_footer_at_92_percent(self) -> None:
@@ -601,31 +598,27 @@ class DestinationResolutionRegressions(unittest.TestCase):
 
                 self.assertIsNone(destination)
 
-    def test_repeated_centered_footer_glyph_error_can_be_safely_overridden(self) -> None:
+    def test_visual_margin_ocr_confirmation_can_clear_a_footer_conflict(
+        self,
+    ) -> None:
         analyses = [analysis(index) for index in range(10)]
-
-        def footer(page_index: int, raw: str, text: str = "") -> linker.PageAnalysis:
-            return analysis(
-                page_index,
-                normalized_text=text,
-                margin_labels=[
-                    linker.PageLabelObservation(
-                        page_index,
-                        int(raw),
-                        "arabic",
-                        raw,
-                        top=PAGE_HEIGHT * 0.92,
-                        bottom=PAGE_HEIGHT * 0.92 + 12.0,
-                        x0=292.0,
-                        x1=308.0,
-                        page_width=PAGE_WIDTH,
-                        page_height=PAGE_HEIGHT,
-                    )
-                ],
-            )
-
-        analyses[5] = footer(5, "512", "chapter 69 the death of lavana")
-        analyses[6] = footer(6, "513")
+        analyses[5] = analysis(
+            5,
+            margin_labels=[
+                linker.PageLabelObservation(
+                    5,
+                    512,
+                    "arabic",
+                    "512",
+                    top=PAGE_HEIGHT * 0.92,
+                    bottom=PAGE_HEIGHT * 0.94,
+                    x0=292.0,
+                    x1=308.0,
+                    page_width=PAGE_WIDTH,
+                    page_height=PAGE_HEIGHT,
+                )
+            ],
+        )
         row = linker.TocRow(
             0,
             "The Death of Lavana",
@@ -638,8 +631,15 @@ class DestinationResolutionRegressions(unittest.TestCase):
         segments = [
             linker.PaginationSegment(0, "arabic", 560, 580, -566, 10, 1.0)
         ]
+        confirmation = {
+            (5, 572, "arabic"): {
+                "expected": 572,
+                "native_text_label": 512,
+                "ocr_tokens": [{"text": "572", "confidence": 0.99}],
+            }
+        }
 
-        destination, _, _, evidence = linker.resolve_toc_row(
+        destination, _, confidence, evidence = linker.resolve_toc_row(
             row,
             0,
             [(0, 0)],
@@ -647,11 +647,13 @@ class DestinationResolutionRegressions(unittest.TestCase):
             analyses,
             [item.normalized_text for item in analyses],
             {0},
+            visual_margin_confirmations=confirmation,
         )
 
         self.assertEqual(destination, 5)
+        self.assertEqual(confidence, "high")
         self.assertEqual(
-            evidence["footer_ocr_substitution_override"]["substitution"], "7->1"
+            evidence["visual_margin_confirmation"]["native_text_label"], 512
         )
 
     def test_footer_glyph_error_without_matching_neighbor_stays_blocked(self) -> None:
@@ -699,29 +701,30 @@ class DestinationResolutionRegressions(unittest.TestCase):
 
         self.assertIsNone(destination)
 
-    def test_isolated_text_layer_digit_error_does_not_block_a_stable_segment(self) -> None:
+    def test_isolated_text_layer_digit_error_requires_visual_confirmation(
+        self,
+    ) -> None:
         analyses = [analysis(index) for index in range(8)]
-        for page_index, printed_number in ((3, 103), (5, 105)):
-            analyses[page_index] = analysis(
-                page_index,
-                margin_labels=[
-                    linker.PageLabelObservation(
-                        page_index,
-                        printed_number,
-                        "arabic",
-                        str(printed_number),
-                    )
-                ],
-            )
         analyses[4] = analysis(
             4,
             margin_labels=[
-                linker.PageLabelObservation(4, 114, "arabic", "114")
+                linker.PageLabelObservation(
+                    4,
+                    114,
+                    "arabic",
+                    "114",
+                    top=PAGE_HEIGHT * 0.92,
+                    bottom=PAGE_HEIGHT * 0.94,
+                    x0=292.0,
+                    x1=308.0,
+                    page_width=PAGE_WIDTH,
+                    page_height=PAGE_HEIGHT,
+                )
             ],
         )
         row = linker.TocRow(
             0,
-            "Unmatched chapter title",
+            "A chapter title",
             "104",
             104,
             "arabic",
@@ -731,7 +734,7 @@ class DestinationResolutionRegressions(unittest.TestCase):
             linker.PaginationSegment(0, "arabic", 100, 108, -99, 8, 1.0)
         ]
 
-        destination, _, _, _ = linker.resolve_toc_row(
+        blocked, _, _, _ = linker.resolve_toc_row(
             row,
             0,
             [(0, 0)],
@@ -740,8 +743,21 @@ class DestinationResolutionRegressions(unittest.TestCase):
             [item.normalized_text for item in analyses],
             {0},
         )
+        confirmed, _, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            segments,
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            visual_margin_confirmations={(4, 104, "arabic"): {"expected": 104}},
+        )
 
-        self.assertEqual(destination, 4)
+        self.assertIsNone(blocked)
+        self.assertEqual(confirmed, 4)
+        self.assertEqual(confidence, "high")
+        self.assertEqual(evidence["visual_margin_confirmation"]["expected"], 104)
 
     def test_locally_sequenced_conflicting_footer_still_blocks_a_segment(self) -> None:
         analyses = [analysis(index) for index in range(8)]
@@ -785,12 +801,16 @@ class DestinationResolutionRegressions(unittest.TestCase):
             "candidate destination has a conflicting printed page label",
         )
 
-    def test_chapter_heading_confirms_a_one_page_footer_mismatch(self) -> None:
+    def test_one_page_footer_conflict_requires_visual_confirmation(
+        self,
+    ) -> None:
         analyses = [analysis(index) for index in range(10)]
         analyses[5] = analysis(
             5,
             normalized_text="chapter 26 unreadable scanned heading",
-            margin_labels=[linker.PageLabelObservation(5, 6, "arabic", "6")],
+            margin_labels=[
+                linker.PageLabelObservation(5, 6, "arabic", "6")
+            ],
         )
         row = linker.TocRow(
             0,
@@ -803,7 +823,7 @@ class DestinationResolutionRegressions(unittest.TestCase):
         )
         segments = [linker.PaginationSegment(0, "arabic", 1, 10, 1, 8, 1.0)]
 
-        destination, _, confidence, evidence = linker.resolve_toc_row(
+        destination, _, _, _ = linker.resolve_toc_row(
             row,
             0,
             [(0, 0)],
@@ -812,11 +832,21 @@ class DestinationResolutionRegressions(unittest.TestCase):
             [item.normalized_text for item in analyses],
             {0},
         )
+        confirmed, _, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            segments,
+            analyses,
+            [item.normalized_text for item in analyses],
+            {0},
+            visual_margin_confirmations={(5, 5, "arabic"): {"expected": 5}},
+        )
 
-        self.assertEqual(destination, 5)
+        self.assertIsNone(destination)
+        self.assertEqual(confirmed, 5)
         self.assertEqual(confidence, "high")
-        self.assertTrue(evidence.get("ordinal_heading_match"))
-        self.assertTrue(evidence.get("one_page_label_override"))
+        self.assertEqual(evidence["visual_margin_confirmation"]["expected"], 5)
 
     def test_unique_title_cannot_bypass_a_visible_conflicting_footer(self) -> None:
         analyses = [analysis(index) for index in range(4)]
@@ -910,26 +940,27 @@ class DestinationResolutionRegressions(unittest.TestCase):
         self.assertEqual(evidence.get("target_margin_labels"), [9])
         self.assertEqual(evidence.get("target_title_score"), 1.0)
 
-    def test_adjacent_titles_can_confirm_a_one_page_label_override(self) -> None:
+    def test_adjacent_titles_cannot_bypass_a_visible_conflicting_footer(
+        self,
+    ) -> None:
         analyses = [analysis(index) for index in range(10)]
         analyses[5] = analysis(
             5,
-            normalized_text="sarana tells his story",
-            margin_labels=[linker.PageLabelObservation(5, 6, "arabic", "6")],
+            normalized_text="sarana tells ravana the principal leaders of the monkeys",
+            margin_labels=[
+                linker.PageLabelObservation(5, 6, "arabic", "6")
+            ],
         )
-        normalized_pages = [item.normalized_text for item in analyses]
         row = linker.TocRow(
             0,
-            "25. Other chapter 26. Sarana tells his story 27. Next chapter",
+            "25. Other chapter 26. Sarana tells story 27. Next chapter",
             "5",
             5,
             "arabic",
             (10, 10, 100, 30),
             ordinal=26,
         )
-        segments = [
-            linker.PaginationSegment(0, "arabic", 1, 10, 1, 8, 1.0),
-        ]
+        segments = [linker.PaginationSegment(0, "arabic", 1, 10, 1, 8, 1.0)]
 
         destination, matched_by, confidence, evidence = linker.resolve_toc_row(
             row,
@@ -937,14 +968,270 @@ class DestinationResolutionRegressions(unittest.TestCase):
             [(0, 0)],
             segments,
             analyses,
-            normalized_pages,
+            [item.normalized_text for item in analyses],
+            {0},
+        )
+
+        self.assertIsNone(destination)
+        self.assertIsNone(matched_by)
+        self.assertEqual(confidence, "low")
+        self.assertIn("conflicting printed page label", evidence["reason"])
+
+
+class ExplicitHeadingAnchorRegressionTests(unittest.TestCase):
+    def test_explicit_top_heading_confirms_a_restarted_pagination_section(self) -> None:
+        analyses = [analysis(index) for index in range(8)]
+        analyses[5] = analysis(
+            5,
+            [
+                word("SECTION", 190.0, 60.0),
+                word("CCX", 285.0, 60.0),
+                word("Rajya-labha", 175.0, 82.0),
+                word("Parva", 290.0, 82.0),
+            ],
+            margin_labels=[
+                linker.PageLabelObservation(
+                    5,
+                    59,
+                    "arabic",
+                    "59",
+                    top=PAGE_HEIGHT * 0.95,
+                    bottom=PAGE_HEIGHT * 0.97,
+                    x0=40.0,
+                    x1=55.0,
+                    page_width=PAGE_WIDTH,
+                    page_height=PAGE_HEIGHT,
+                )
+            ],
+        )
+        row = linker.TocRow(
+            0,
+            "CCX-CCXIV Parva Rajya-labha",
+            "3-12",
+            3,
+            "arabic",
+            (10.0, 10.0, 100.0, 30.0),
+            ordinal=210,
+            structural_heading_kind="section",
+        )
+        destination, matched_by, confidence, evidence = linker.resolve_toc_row(
+            row,
+            0,
+            [(0, 0)],
+            [linker.PaginationSegment(0, "arabic", 2, 519, 3, 332, 0.64)],
+            analyses,
+            [item.normalized_text for item in analyses],
             {0},
         )
 
         self.assertEqual(destination, 5)
         self.assertEqual(matched_by, "pagination-segment")
         self.assertEqual(confidence, "high")
-        self.assertTrue(evidence.get("one_page_label_override"))
+        self.assertEqual(evidence["explicit_heading_anchor"]["heading_type"], "section")
+
+    def test_identical_heading_without_structural_row_provenance_stays_blocked(self) -> None:
+        row = linker.TocRow(
+            0,
+            "CCX-CCXIV Parva Rajya-labha",
+            "3-12",
+            3,
+            "arabic",
+            (10.0, 10.0, 100.0, 30.0),
+            ordinal=210,
+        )
+        candidate = analysis(
+            5,
+            [
+                word("SECTION", 190.0, 60.0),
+                word("CCX", 285.0, 60.0),
+                word("Rajya-labha", 175.0, 82.0),
+                word("Parva", 290.0, 82.0),
+            ],
+        )
+
+        self.assertIsNone(linker.explicit_heading_anchor(candidate, row))
+
+    def test_wrong_section_ordinal_cannot_count_as_an_explicit_heading(self) -> None:
+        row = linker.TocRow(
+            0,
+            "CCX-CCXIV Parva Rajya-labha",
+            "3-12",
+            3,
+            "arabic",
+            (10.0, 10.0, 100.0, 30.0),
+            ordinal=210,
+            structural_heading_kind="section",
+        )
+        candidate = analysis(
+            5,
+            [
+                word("SECTION", 190.0, 60.0),
+                word("CCXI", 285.0, 60.0),
+            ],
+        )
+
+        self.assertIsNone(linker.explicit_heading_anchor(candidate, row))
+
+
+class MarginOCRRegressionTests(unittest.TestCase):
+    def test_confirmation_requires_one_exact_high_confidence_label(self) -> None:
+        observation = linker.PageLabelObservation(
+            4,
+            114,
+            "arabic",
+            "114",
+            top=PAGE_HEIGHT * 0.92,
+            bottom=PAGE_HEIGHT * 0.94,
+            x0=292.0,
+            x1=308.0,
+            page_width=PAGE_WIDTH,
+            page_height=PAGE_HEIGHT,
+        )
+        region = linker.margin_ocr_region_for_observation("footer", observation)
+        self.assertIsNotNone(region)
+        assert region is not None
+        check = linker.MarginOCRCheck(
+            region=region,
+            expected_number=104,
+            label_kind="arabic",
+            observation=observation,
+        )
+
+        confirmed = linker.confirmed_margin_ocr_labels(
+            [check],
+            {"footer": [("104", 0.99)]},
+        )
+        ambiguous = linker.confirmed_margin_ocr_labels(
+            [check],
+            {"footer": [("104", 0.99), ("114", 0.99)]},
+        )
+        low_confidence = linker.confirmed_margin_ocr_labels(
+            [check],
+            {"footer": [("104", 0.89)]},
+        )
+
+        self.assertIn((4, 104, "arabic"), confirmed)
+        self.assertEqual(ambiguous, {})
+        self.assertEqual(low_confidence, {})
+        self.assertLess(region.bottom_ratio - region.top_ratio, 0.20)
+        self.assertLess(region.x1_ratio - region.x0_ratio, 0.45)
+
+    def test_retry_confirmation_cannot_erase_first_pass_confirmation(self) -> None:
+        key = (4, 104, "arabic")
+        first_pass = {key: {"region": "footer", "expected": 104}}
+        retry = {key: {"region": "footer:retry", "expected": 104}}
+
+        merged = linker.merge_margin_ocr_confirmations(first_pass, retry)
+
+        self.assertEqual(merged[key]["region"], "footer")
+
+    def test_requests_are_limited_to_strong_conflicting_destinations(self) -> None:
+        analyses = [analysis(index) for index in range(8)]
+        conflict = linker.PageLabelObservation(
+            4,
+            114,
+            "arabic",
+            "114",
+            top=PAGE_HEIGHT * 0.92,
+            bottom=PAGE_HEIGHT * 0.94,
+            x0=292.0,
+            x1=308.0,
+            page_width=PAGE_WIDTH,
+            page_height=PAGE_HEIGHT,
+        )
+        analyses[4] = analysis(4, margin_labels=[conflict])
+        row = linker.TocRow(
+            0,
+            "A chapter title",
+            "104",
+            104,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+        segments = [
+            linker.PaginationSegment(0, "arabic", 100, 108, -99, 8, 1.0)
+        ]
+
+        checks, regions = linker.conflicting_margin_ocr_checks(
+            {0: [row]},
+            {0},
+            [(0, 0)],
+            segments,
+            analyses,
+        )
+        analyses[4] = analysis(
+            4,
+            margin_labels=[
+                linker.PageLabelObservation(
+                    4,
+                    104,
+                    "arabic",
+                    "104",
+                    top=PAGE_HEIGHT * 0.92,
+                    bottom=PAGE_HEIGHT * 0.94,
+                    x0=292.0,
+                    x1=308.0,
+                    page_width=PAGE_WIDTH,
+                    page_height=PAGE_HEIGHT,
+                )
+            ],
+        )
+        no_checks, no_regions = linker.conflicting_margin_ocr_checks(
+            {0: [row]},
+            {0},
+            [(0, 0)],
+            segments,
+            analyses,
+        )
+
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(checks[0].expected_number, 104)
+        self.assertEqual(no_checks, [])
+        self.assertEqual(no_regions, [])
+
+    def test_outer_margin_conflict_also_checks_the_center_footer(self) -> None:
+        analyses = [analysis(index) for index in range(8)]
+        outer = linker.PageLabelObservation(
+            4,
+            1,
+            "arabic",
+            "1",
+            top=PAGE_HEIGHT * 0.90,
+            bottom=PAGE_HEIGHT * 0.92,
+            x0=18.0,
+            x1=22.0,
+            page_width=PAGE_WIDTH,
+            page_height=PAGE_HEIGHT,
+        )
+        analyses[4] = analysis(4, margin_labels=[outer])
+        row = linker.TocRow(
+            0,
+            "A chapter title",
+            "104",
+            104,
+            "arabic",
+            (10, 10, 100, 30),
+        )
+        checks, regions = linker.conflicting_margin_ocr_checks(
+            {0: [row]},
+            {0},
+            [(0, 0)],
+            [linker.PaginationSegment(0, "arabic", 100, 108, -99, 8, 1.0)],
+            analyses,
+        )
+        center = next(region for region in regions if region.key.endswith(":center"))
+        confirmations = linker.confirmed_margin_ocr_labels(
+            checks,
+            {
+                checks[0].region.key: [("1", 0.99)],
+                center.key: [("104", 0.99)],
+            },
+        )
+
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(center.x0_ratio, 0.30)
+        self.assertIn((4, 104, "arabic"), confirmations)
 
 
 if __name__ == "__main__":

@@ -34,9 +34,12 @@ from pypdf.generic import (
 )
 
 from local_ocr import (
+    MarginOCRRegion,
+    MarginOCRSummary,
     NavigationOCRSummary,
     OCRSummary,
     ocr_low_text_pages,
+    ocr_margin_regions,
     ocr_navigation_columns,
 )
 from progress_events import emit_progress
@@ -44,6 +47,7 @@ from skill_provenance import require_isolated_runtime
 
 
 TOC_HEADINGS = ("table of contents", "contents", "agenda", "index")
+MARGIN_OCR_ACCEPTANCE_CONFIDENCE = 0.90
 PAGE_TOKEN_RE = re.compile(r"^[\s.·•()\[\]-]*([0-9]{1,4}|[ivxlcdm]{1,10})[\s.·•()\[\]-]*$", re.I)
 PAGE_RANGE_RE = re.compile(
     r"^[\s.·•()\[\]]*([0-9]{1,4})\s*[-–—―�]+\s*([0-9]{1,4})[\s.·•()\[\]]*$"
@@ -72,6 +76,7 @@ class TocRow:
     label_candidates: tuple[tuple[int, str], ...] = ()
     ordinal: int | None = None
     navigation_ocr: bool = False
+    structural_heading_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,16 @@ class PageAnalysis:
     content_stream_bytes: int
     margin_labels: list[PageLabelObservation]
     ordinal_anchor_count: int
+
+
+@dataclass(frozen=True)
+class MarginOCRCheck:
+    """One visual label check prompted by a native-text margin conflict."""
+
+    region: MarginOCRRegion
+    expected_number: int
+    label_kind: str
+    observation: PageLabelObservation
 
 
 def normalize_text(value: str) -> str:
@@ -532,6 +547,7 @@ def _semantic_range_rows(page_index: int, page, words: Sequence[dict]) -> list[T
                 _row_rect(page, row_words),
                 tuple((candidate_start, "arabic") for candidate_start, _ in ranges),
                 ordinal=section_ordinal,
+                structural_heading_kind="section",
             )
         )
         previous_bottom = float(anchor["bottom"])
@@ -1367,27 +1383,43 @@ def toc_title_variants(title: str, ordinal: int | None = None) -> list[str]:
     return variants
 
 
-def page_has_chapter_heading(normalized_page: str, ordinal: int | None) -> bool:
-    """Confirm a chapter/section ordinal from an explicit destination heading."""
 
-    if ordinal is None or ordinal <= 0:
-        return False
-    labels = {str(ordinal), int_to_roman(ordinal).lower()}
-    if any(
-        re.search(rf"\b(?:chapter|section)\s+{re.escape(label)}\b", normalized_page)
-        for label in labels
+
+def explicit_heading_anchor(
+    analysis: PageAnalysis,
+    row: TocRow,
+) -> dict | None:
+    """Confirm a parsed SECTION-range row from an exact section heading.
+
+    The parser adds this row provenance only for a structured SECTION / Roman
+    range / page-range layout. This deliberately does not turn a loose title
+    match, a body-text mention, or another heading kind into a fallback.
+    """
+
+    if (
+        row.structural_heading_kind != "section"
+        or row.ordinal is None
+        or row.ordinal <= 0
+        or not analysis.lines
     ):
-        return True
-    for match in re.finditer(
-        r"\b(?:chapter|section)\s+([a-z0-9]{1,10})\b",
-        normalized_page,
-    ):
-        token = match.group(1)
-        candidates = {number for number, _ in page_label_candidates(token)}
-        parsed_ordinal = _toc_ordinal(token)
-        if ordinal in candidates or parsed_ordinal == ordinal:
-            return True
-    return False
+        return None
+    expected_ordinal = int_to_roman(row.ordinal).casefold()
+    heading_pattern = re.compile(
+        rf"\bsection\s+{re.escape(expected_ordinal)}\b",
+        re.I,
+    )
+    for line in analysis.lines:
+        if not line:
+            continue
+        if min(float(word["top"]) for word in line) > analysis.height * 0.20:
+            continue
+        line_text = normalize_text(" ".join(str(word["text"]) for word in line))
+        if heading_pattern.search(line_text) is not None:
+            return {
+                "heading_type": "section",
+                "ordinal": row.ordinal,
+            }
+    return None
 
 
 def likely_toc_line_count(analysis: PageAnalysis) -> int:
@@ -1524,163 +1556,231 @@ def visible_margin_numbers(analysis: PageAnalysis, label_kind: str) -> list[int]
     )
 
 
-def locally_supported_margin_numbers(
-    analyses: Sequence[PageAnalysis],
-    page_index: int,
-    label_kind: str,
-    expected_number: int | None = None,
-) -> list[int]:
-    """Keep conflicts unless neighbours positively support the expected label.
+def margin_ocr_region_for_observation(
+    key: str,
+    observation: PageLabelObservation,
+) -> MarginOCRRegion | None:
+    """Return a generous, isolated edge band around one visible label."""
 
-    Scanned books sometimes expose a selectable text layer whose digit glyphs
-    decode incorrectly (for example, a visible ``184`` may extract as ``114``).
-    Ignore such an outlier only when nearby pages form the expected sequence.
-    An unrelated neighbour must never make visible conflict evidence disappear.
-    """
-
-    observed = visible_margin_numbers(analyses[page_index], label_kind)
-    neighbours: list[tuple[int, int]] = []
-    for neighbour_index in range(
-        max(0, page_index - 2),
-        min(len(analyses), page_index + 3),
+    if (
+        observation.x0 is None
+        or observation.x1 is None
+        or observation.top is None
+        or observation.page_width is None
+        or observation.page_height is None
+        or observation.page_width <= 0
+        or observation.page_height <= 0
     ):
-        if neighbour_index == page_index:
-            continue
-        neighbours.extend(
-            (neighbour_index, number)
-            for number in visible_margin_numbers(
-                analyses[neighbour_index],
-                label_kind,
-            )
-        )
-    expected_sequence_support = {
-        neighbour_index
-        for neighbour_index, neighbour_number in neighbours
-        if expected_number is not None
-        and neighbour_index - page_index == neighbour_number - expected_number
-    }
-    expected_sequence_supported = len(expected_sequence_support) >= 2
-    return sorted(
-        number
-        for number in observed
-        if (
-            any(
-                neighbour_index - page_index == neighbour_number - number
-                for neighbour_index, neighbour_number in neighbours
-            )
-            or not expected_sequence_supported
-        )
+        return None
+    center_ratio = (
+        (observation.x0 + observation.x1) / 2 / observation.page_width
+    )
+    label_width_ratio = (
+        max(0.0, observation.x1 - observation.x0) / observation.page_width
+    )
+    label_top_ratio = observation.top / observation.page_height
+    label_bottom_ratio = (
+        (observation.bottom or observation.top) / observation.page_height
+    )
+    half_width = max(0.20, label_width_ratio * 3)
+    x0_ratio = max(0.0, center_ratio - half_width)
+    x1_ratio = min(1.0, center_ratio + half_width)
+    vertical_padding = max(0.04, (label_bottom_ratio - label_top_ratio) * 3)
+    top_ratio = max(0.0, label_top_ratio - vertical_padding)
+    bottom_ratio = min(1.0, label_bottom_ratio + vertical_padding)
+    if bottom_ratio - top_ratio < 0.09:
+        midpoint = (top_ratio + bottom_ratio) / 2
+        top_ratio = max(0.0, midpoint - 0.045)
+        bottom_ratio = min(1.0, midpoint + 0.045)
+    return MarginOCRRegion(
+        key=key,
+        page_index=observation.page_index,
+        x0_ratio=x0_ratio,
+        top_ratio=top_ratio,
+        x1_ratio=x1_ratio,
+        bottom_ratio=bottom_ratio,
     )
 
 
-def _bottom_center_digit_observations(
-    analysis: PageAnalysis,
-) -> list[PageLabelObservation]:
-    observations: list[PageLabelObservation] = []
-    for observation in analysis.margin_labels:
-        if (
-            observation.label_kind != "arabic"
-            or observation.top is None
-            or observation.x0 is None
-            or observation.x1 is None
-            or observation.page_width is None
-            or observation.page_height is None
-            or not re.fullmatch(r"[0-9]+", observation.raw.strip())
-        ):
-            continue
-        center = (observation.x0 + observation.x1) / 2
-        if (
-            observation.top >= observation.page_height * 0.88
-            and abs(center - observation.page_width / 2)
-            <= observation.page_width * 0.14
-        ):
-            observations.append(observation)
-    return observations
-
-
-def _single_digit_substitution(
-    expected_number: int, observed_text: str
-) -> tuple[int, str, str] | None:
-    expected_text = str(expected_number)
-    observed_text = observed_text.strip()
-    if len(expected_text) != len(observed_text) or not observed_text.isdigit():
-        return None
-    differences = [
-        index
-        for index, (expected, observed) in enumerate(
-            zip(expected_text, observed_text, strict=True)
-        )
-        if expected != observed
-    ]
-    if len(differences) != 1:
-        return None
-    index = differences[0]
-    substitution = (index, expected_text[index], observed_text[index])
-    if substitution[1:] not in {("7", "1"), ("1", "7")}:
-        return None
-    return substitution
-
-
-def corroborated_footer_ocr_substitution(
+def conflicting_margin_ocr_checks(
+    rows_by_page: Mapping[int, Sequence[TocRow]],
+    toc_pages: set[int],
+    blocks: Sequence[tuple[int, int]],
+    segments: Sequence[PaginationSegment],
     analyses: Sequence[PageAnalysis],
-    page_index: int,
-    expected_number: int,
-    conflicting_number: int,
-) -> dict | None:
-    """Confirm a repeated 7/1 glyph-decoding error in centred footers."""
+) -> tuple[list[MarginOCRCheck], list[MarginOCRRegion]]:
+    """Prepare OCR only for strong pagination candidates with edge conflicts."""
 
-    current_observations = _bottom_center_digit_observations(analyses[page_index])
-    for current in current_observations:
-        if current.printed_number != conflicting_number:
+    checks: list[MarginOCRCheck] = []
+    regions: dict[str, MarginOCRRegion] = {}
+    seen_checks: set[tuple[int, int, str, str]] = set()
+    for source_page in sorted(toc_pages):
+        block_index = block_index_for_page(source_page, blocks)
+        if block_index is None:
             continue
-        substitution = _single_digit_substitution(expected_number, current.raw)
-        if substitution is None:
-            continue
-        position, expected_digit, observed_digit = substitution
-        for page_delta in (-1, 1):
-            neighbour_index = page_index + page_delta
-            neighbour_expected = expected_number + page_delta
-            if not (0 <= neighbour_index < len(analyses)) or neighbour_expected <= 0:
-                continue
-            for neighbour in _bottom_center_digit_observations(
-                analyses[neighbour_index]
-            ):
-                neighbour_substitution = _single_digit_substitution(
-                    neighbour_expected, neighbour.raw
-                )
-                if neighbour_substitution != substitution:
-                    continue
-                assert current.page_width is not None
-                assert current.page_height is not None
-                assert current.x0 is not None and current.x1 is not None
-                assert current.top is not None
-                assert neighbour.page_width is not None
-                assert neighbour.page_height is not None
-                assert neighbour.x0 is not None and neighbour.x1 is not None
-                assert neighbour.top is not None
-                current_center_ratio = (
-                    (current.x0 + current.x1) / 2 / current.page_width
-                )
-                neighbour_center_ratio = (
-                    (neighbour.x0 + neighbour.x1) / 2 / neighbour.page_width
-                )
-                current_top_ratio = current.top / current.page_height
-                neighbour_top_ratio = neighbour.top / neighbour.page_height
+        allowed_pages = block_content_pages(block_index, blocks, len(analyses))
+        for row in rows_by_page.get(source_page, ()):
+            for segment in segments:
                 if (
-                    abs(current_center_ratio - neighbour_center_ratio) > 0.03
-                    or abs(current_top_ratio - neighbour_top_ratio) > 0.03
+                    segment.block_index != block_index
+                    or segment.label_kind != row.label_kind
+                    or segment.evidence_pages < 3
                 ):
                     continue
-                return {
-                    "expected": expected_number,
-                    "observed": int(current.raw.strip()),
-                    "neighbor_expected": neighbour_expected,
-                    "neighbor_observed": int(neighbour.raw.strip()),
-                    "neighbor_page": neighbour_index + 1,
-                    "substitution": f"{expected_digit}->{observed_digit}",
-                    "digit_position": position,
-                }
-    return None
+                destination = row.printed_number + segment.offset - 1
+                near_segment = (
+                    segment.printed_start - 4
+                    <= row.printed_number
+                    <= segment.printed_end + 4
+                )
+                if (
+                    not near_segment
+                    or destination not in allowed_pages
+                    or not 0 <= destination < len(analyses)
+                    or row.printed_number
+                    in visible_margin_numbers(analyses[destination], row.label_kind)
+                ):
+                    continue
+                for observation in analyses[destination].margin_labels:
+                    if (
+                        observation.label_kind != row.label_kind
+                        or observation.printed_number == row.printed_number
+                        or not eligible_margin_observation(observation)
+                    ):
+                        continue
+                    key = (
+                        f"{destination}:{row.label_kind}:"
+                        f"{round(float(observation.x0 or 0.0), 1)}:"
+                        f"{round(float(observation.top or 0.0), 1)}"
+                    )
+                    region = regions.get(key)
+                    if region is None:
+                        region = margin_ocr_region_for_observation(key, observation)
+                        if region is None:
+                            continue
+                        regions[key] = region
+                    signature = (
+                        destination,
+                        row.printed_number,
+                        row.label_kind,
+                        key,
+                    )
+                    if signature in seen_checks:
+                        continue
+                    seen_checks.add(signature)
+                    checks.append(
+                        MarginOCRCheck(
+                            region=region,
+                            expected_number=row.printed_number,
+                            label_kind=row.label_kind,
+                            observation=observation,
+                        )
+                    )
+                    if region.x0_ratio <= 0.01 or region.x1_ratio >= 0.99:
+                        center_key = f"{key}:center"
+                        center_region = regions.get(center_key)
+                        if center_region is None:
+                            center_region = MarginOCRRegion(
+                                key=center_key,
+                                page_index=region.page_index,
+                                x0_ratio=0.30,
+                                top_ratio=0.90,
+                                x1_ratio=0.70,
+                                bottom_ratio=1.0,
+                            )
+                            regions[center_key] = center_region
+                        center_signature = (
+                            destination,
+                            row.printed_number,
+                            row.label_kind,
+                            center_key,
+                        )
+                        if center_signature not in seen_checks:
+                            seen_checks.add(center_signature)
+                            checks.append(
+                                MarginOCRCheck(
+                                    region=center_region,
+                                    expected_number=row.printed_number,
+                                    label_kind=row.label_kind,
+                                    observation=observation,
+                                )
+                            )
+    return checks, list(regions.values())
+
+
+def ocr_margin_numbers(
+    tokens: Sequence[tuple[str, float]],
+    label_kind: str,
+) -> set[int]:
+    """Return only high-confidence, standalone OCR page labels.
+
+    OCR substitutions can turn normal words such as "is" into a plausible
+    number. Margin confirmation deliberately accepts digit-only Arabic text;
+    Roman labels keep their strict native parser.
+    """
+
+    numbers: set[int] = set()
+    for raw, confidence in tokens:
+        if float(confidence) < MARGIN_OCR_ACCEPTANCE_CONFIDENCE:
+            continue
+        token = str(raw).strip()
+        if label_kind == "arabic":
+            if re.fullmatch(r"[0-9]{1,4}", token):
+                numbers.add(int(token))
+            continue
+        parsed = parse_page_label_details(token)
+        if parsed is not None and parsed[1] == label_kind:
+            numbers.add(parsed[0])
+    return numbers
+
+
+def confirmed_margin_ocr_labels(
+    checks: Sequence[MarginOCRCheck],
+    ocr_tokens: Mapping[str, Sequence[tuple[str, float]]],
+) -> dict[tuple[int, int, str], dict]:
+    """Keep exact visual confirmations separate from native page analysis."""
+
+    confirmations: dict[tuple[int, int, str], dict] = {}
+    for check in checks:
+        tokens = list(ocr_tokens.get(check.region.key, ()))
+        numbers = ocr_margin_numbers(tokens, check.label_kind)
+        if numbers != {check.expected_number}:
+            continue
+        confirmation_key = (
+            check.observation.page_index,
+            check.expected_number,
+            check.label_kind,
+        )
+        if confirmation_key in confirmations:
+            continue
+        confirmations[confirmation_key] = {
+            "page": check.observation.page_index + 1,
+            "expected": check.expected_number,
+            "native_text_label": check.observation.printed_number,
+            "label_kind": check.label_kind,
+            "region": check.region.key,
+            "ocr_tokens": [
+                {"text": raw, "confidence": confidence}
+                for raw, confidence in tokens
+            ],
+        }
+    return confirmations
+
+
+
+
+
+
+def merge_margin_ocr_confirmations(
+    initial: Mapping[tuple[int, int, str], dict],
+    retry: Mapping[tuple[int, int, str], dict],
+) -> dict[tuple[int, int, str], dict]:
+    """Keep an exact first-pass visual confirmation if a retry is weaker."""
+
+    merged = dict(initial)
+    for confirmation_key, confirmation in retry.items():
+        merged.setdefault(confirmation_key, confirmation)
+    return merged
 
 
 def resolve_toc_row(
@@ -1691,6 +1791,7 @@ def resolve_toc_row(
     analyses: Sequence[PageAnalysis],
     normalized_pages: Sequence[str],
     toc_pages: set[int],
+    visual_margin_confirmations: Mapping[tuple[int, int, str], dict] | None = None,
 ) -> tuple[int | None, str | None, str, dict]:
     page_count = len(analyses)
     allowed_content_pages = block_content_pages(block_index, blocks, page_count)
@@ -1728,18 +1829,26 @@ def resolve_toc_row(
             analyses[destination], block_index, row.label_kind, segments
         )
         observed = visible_margin_numbers(analyses[destination], row.label_kind)
-        exact_label = row.printed_number in trusted_observed
-        supported_observed = locally_supported_margin_numbers(
-            analyses,
-            destination,
-            row.label_kind,
-            row.printed_number,
+        visual_margin_confirmation = (visual_margin_confirmations or {}).get(
+            (destination, row.printed_number, row.label_kind)
+        )
+        heading_anchor = explicit_heading_anchor(analyses[destination], row)
+        structural_heading_confirmation = (
+            heading_anchor
+            if (
+                heading_anchor is not None
+                and near_segment
+                and segment.evidence_pages >= 8
+            )
+            else None
+        )
+        exact_label = (
+            row.printed_number in trusted_observed
+            or visual_margin_confirmation is not None
+            or structural_heading_confirmation is not None
         )
         conflicting_numbers = [
-            number
-            for number in observed
-            if number in supported_observed
-            or abs(number - row.printed_number) <= 1
+            number for number in observed if number != row.printed_number
         ]
         conflicting_label = bool(conflicting_numbers) and not exact_label
         title_variants = toc_title_variants(row.title, row.ordinal)
@@ -1748,54 +1857,6 @@ def resolve_toc_row(
             for variant in title_variants
         ]
         title_score, _ = max(variant_scores, default=(0.0, row.title))
-        ordinal_heading_match = page_has_chapter_heading(
-            normalized_pages[destination], row.ordinal
-        )
-        one_page_label_override = False
-        footer_ocr_substitution_override: dict | None = None
-        if (
-            conflicting_label
-            and len(conflicting_numbers) == 1
-            and abs(conflicting_numbers[0] - row.printed_number) == 1
-            and (title_score >= 0.9 or ordinal_heading_match)
-        ):
-            if ordinal_heading_match:
-                conflicting_label = False
-                one_page_label_override = True
-                title_score = max(title_score, 0.95)
-            else:
-                for candidate_score, title_variant in sorted(
-                    variant_scores, reverse=True
-                ):
-                    if candidate_score < 0.9:
-                        continue
-                    unique_destination, unique_score = unique_title_destination(
-                        title_variant,
-                        normalized_pages,
-                        toc_pages,
-                        allowed_pages=allowed_content_pages,
-                    )
-                    if unique_destination == destination and unique_score >= 0.95:
-                        conflicting_label = False
-                        one_page_label_override = True
-                        break
-        if (
-            conflicting_label
-            and near_segment
-            and segment.evidence_pages >= 8
-            and ordinal_heading_match
-            and title_score >= 0.6
-            and len(conflicting_numbers) == 1
-        ):
-            footer_ocr_substitution_override = corroborated_footer_ocr_substitution(
-                analyses,
-                destination,
-                row.printed_number,
-                conflicting_numbers[0],
-            )
-            if footer_ocr_substitution_override is not None:
-                conflicting_label = False
-                title_score = max(title_score, 0.95)
         score = (2.0 if exact_label else 0.0) + title_score + min(0.5, segment.evidence_pages / 20)
         scored.append(
             (
@@ -1807,8 +1868,6 @@ def resolve_toc_row(
                 observed,
                 near_segment,
                 title_score,
-                one_page_label_override,
-                footer_ocr_substitution_override,
             )
         )
     scored.sort(key=lambda item: (-item[0], -item[3].evidence_pages, item[4]))
@@ -1834,8 +1893,6 @@ def resolve_toc_row(
             observed,
             _,
             title_score,
-            one_page_label_override,
-            footer_ocr_substitution_override,
         ) = chosen
         confidence = "high" if exact_label or title_score >= 0.9 else "medium"
         return destination, "pagination-segment", confidence, {
@@ -1848,12 +1905,9 @@ def resolve_toc_row(
             ),
             "target_margin_labels": observed,
             "target_title_score": round(title_score, 4),
-            "one_page_label_override": one_page_label_override,
-            "footer_ocr_substitution_override": footer_ocr_substitution_override,
             "row_ordinal": row.ordinal,
-            "ordinal_heading_match": page_has_chapter_heading(
-                normalized_pages[destination], row.ordinal
-            ),
+            "visual_margin_confirmation": visual_margin_confirmation,
+            "explicit_heading_anchor": structural_heading_confirmation,
         }
     if scored:
         return None, None, "low", {
@@ -2893,6 +2947,9 @@ def _make_interactive(args: argparse.Namespace) -> dict:
     covered_existing_rows = 0
     ocr_summary: OCRSummary | None = None
     navigation_ocr_summary: NavigationOCRSummary | None = None
+    margin_ocr_summary: MarginOCRSummary | None = None
+    margin_ocr_retry_summary: MarginOCRSummary | None = None
+    margin_ocr_confirmations: dict[tuple[int, int, str], dict] = {}
     preliminary_expected_by_page: dict[int, int] = {}
     covered_replay_links: list[AddedLink] = []
     replay_conflicts: list[dict] = []
@@ -3130,6 +3187,114 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 analyses,
                 normalized_pages,
             )
+            if not args.no_toc_links:
+                margin_checks, margin_regions = conflicting_margin_ocr_checks(
+                    rows_by_page,
+                    toc_pages,
+                    blocks,
+                    pagination_segments,
+                    analyses,
+                )
+                if margin_regions:
+                    emit_progress(
+                        "OCR_PAGES",
+                        completed=0,
+                        total=len(margin_regions),
+                        unit="check",
+                        total_pages=page_count,
+                        message=(
+                            "Visually checking "
+                            f"{len(margin_regions)} uncertain page-number check"
+                            f"{'s' if len(margin_regions) != 1 else ''}"
+                        ),
+                        counts={
+                            "margin_checks": len(margin_checks),
+                            "margin_regions": len(margin_regions),
+                        },
+                    )
+                    try:
+                        margin_ocr_tokens, margin_ocr_summary = ocr_margin_regions(
+                            input_path,
+                            analyses,
+                            margin_regions,
+                            password=args.password,
+                            rotations=rotations,
+                        )
+                        margin_ocr_confirmations = confirmed_margin_ocr_labels(
+                            margin_checks,
+                            margin_ocr_tokens,
+                        )
+                        retry_keys = {
+                            check.region.key
+                            for check in margin_checks
+                            if (
+                                check.observation.page_index,
+                                check.expected_number,
+                                check.label_kind,
+                            )
+                            not in margin_ocr_confirmations
+                        }
+                        # Retry only a tighter footer crop. This is visual
+                        # confirmation, not another way to infer a destination.
+                        retry_regions = [
+                            MarginOCRRegion(
+                                key=region.key,
+                                page_index=region.page_index,
+                                x0_ratio=0.30,
+                                top_ratio=0.90,
+                                x1_ratio=0.70,
+                                bottom_ratio=1.0,
+                            )
+                            for region in margin_regions
+                            if region.key in retry_keys
+                        ]
+                        if retry_regions:
+                            retry_tokens, margin_ocr_retry_summary = (
+                                ocr_margin_regions(
+                                    input_path,
+                                    analyses,
+                                    retry_regions,
+                                    password=args.password,
+                                    rotations=rotations,
+                                    render_scale=3.0,
+                                    batch_size=1,
+                                )
+                            )
+                            retry_confirmations = confirmed_margin_ocr_labels(
+                                margin_checks,
+                                retry_tokens,
+                            )
+                            margin_ocr_confirmations = (
+                                merge_margin_ocr_confirmations(
+                                    margin_ocr_confirmations,
+                                    retry_confirmations,
+                                )
+                            )
+                        emit_progress(
+                            "OCR_PAGES",
+                            completed=len(margin_regions),
+                            total=len(margin_regions),
+                            unit="check",
+                            total_pages=page_count,
+                            message=(
+                                "Finished visual page-number checks "
+                                f"({len(margin_ocr_confirmations)} confirmed)"
+                            ),
+                            counts={
+                                "margin_checks": len(margin_checks),
+                                "margin_regions": len(margin_regions),
+                                "margin_confirmed": len(
+                                    margin_ocr_confirmations
+                                ),
+                            },
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        message = (
+                            "Visual page-number verification could not complete: "
+                            f"{exc}"
+                        )
+                        warnings.append(message)
+                        review_reasons.append(message)
             headingless_navigation_pages = headingless_navigation_candidates(
                 analyses,
                 toc_pages,
@@ -3225,11 +3390,12 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                                 row,
                                 block_index,
                                 blocks,
-                                pagination_segments,
-                                analyses,
-                                normalized_pages,
-                                toc_pages,
-                            )
+                            pagination_segments,
+                            analyses,
+                            normalized_pages,
+                            toc_pages,
+                            visual_margin_confirmations=margin_ocr_confirmations,
+                        )
                         if destination is None or destination == source_page:
                             unresolved.append(
                                 {
@@ -3440,6 +3606,10 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                 or bool(
                     navigation_ocr_summary
                     and navigation_ocr_summary.attempted_pages
+                )
+                or bool(
+                    margin_ocr_summary
+                    and margin_ocr_summary.attempted_pages
                 ),
                 **ocr_summary.as_report(),
                 "navigation_recheck": (
@@ -3447,6 +3617,24 @@ def _make_interactive(args: argparse.Namespace) -> dict:
                     if navigation_ocr_summary is not None
                     else {"attempted_pages": []}
                 ),
+                "margin_recheck": {
+                    "initial": (
+                        margin_ocr_summary.as_report()
+                        if margin_ocr_summary is not None
+                        else {"attempted_pages": []}
+                    ),
+                    "retry": (
+                        margin_ocr_retry_summary.as_report()
+                        if margin_ocr_retry_summary is not None
+                        else {"attempted_pages": []}
+                    ),
+                    "confirmations": [
+                        confirmation
+                        for _, confirmation in sorted(
+                            margin_ocr_confirmations.items()
+                        )
+                    ],
+                },
             }
             if ocr_summary is not None
             else {"used": False}

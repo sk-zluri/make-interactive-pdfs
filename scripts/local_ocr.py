@@ -26,6 +26,9 @@ NAVIGATION_OCR_RENDER_SCALE = 3.0
 NAVIGATION_OCR_RIGHT_COLUMN_RATIO = 0.19
 NAVIGATION_OCR_MAX_BATCH_SIZE = 4
 NAVIGATION_OCR_SEPARATOR_PIXELS = 24
+MARGIN_OCR_RENDER_SCALE = 4.0
+MARGIN_OCR_MAX_BATCH_SIZE = 4
+MARGIN_OCR_SEPARATOR_PIXELS = 24
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,54 @@ class NavigationOCRSummary:
             },
             "render_scale": self.render_scale,
             "right_column_ratio": self.right_column_ratio,
+            "max_batch_size": self.max_batch_size,
+            "render_seconds": self.render_seconds,
+            "ocr_seconds": self.ocr_seconds,
+            "total_seconds": self.total_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class MarginOCRRegion:
+    """One normalized edge region to use as a visual page-label referee."""
+
+    key: str
+    page_index: int
+    x0_ratio: float
+    top_ratio: float
+    x1_ratio: float
+    bottom_ratio: float
+
+
+@dataclass(frozen=True)
+class MarginOCRSummary:
+    """Audit metadata for small, conflict-only page-margin OCR batches."""
+
+    engine: str
+    version: str
+    model_sha256: str
+    attempted_pages: tuple[int, ...]
+    attempted_regions: tuple[str, ...]
+    regions_with_words: tuple[str, ...]
+    failed_regions: tuple[str, ...]
+    batch_count: int
+    render_scale: float = MARGIN_OCR_RENDER_SCALE
+    max_batch_size: int = MARGIN_OCR_MAX_BATCH_SIZE
+    render_seconds: float = 0.0
+    ocr_seconds: float = 0.0
+    total_seconds: float = 0.0
+
+    def as_report(self) -> dict[str, object]:
+        return {
+            "engine": self.engine,
+            "version": self.version,
+            "model_sha256": self.model_sha256,
+            "attempted_pages": list(self.attempted_pages),
+            "attempted_regions": list(self.attempted_regions),
+            "regions_with_words": list(self.regions_with_words),
+            "failed_regions": list(self.failed_regions),
+            "batch_count": self.batch_count,
+            "render_scale": self.render_scale,
             "max_batch_size": self.max_batch_size,
             "render_seconds": self.render_seconds,
             "ocr_seconds": self.ocr_seconds,
@@ -588,6 +639,276 @@ def ocr_navigation_columns(
         total_seconds=round(total_seconds, 4),
     )
     return detected_by_page, summary
+
+
+@dataclass
+class _MarginOCRStrip:
+    region: MarginOCRRegion
+    image: object
+    batch_left: int = 0
+
+
+def _iter_word_results(result: object):
+    """Accept RapidOCR's single-image and batched result shapes."""
+
+    for item in (getattr(result, "word_results", None) or ()):
+        if (
+            isinstance(item, (tuple, list))
+            and len(item) == 3
+            and isinstance(item[0], str)
+        ):
+            yield item
+            continue
+        for candidate in item or ():
+            if (
+                isinstance(candidate, (tuple, list))
+                and len(candidate) == 3
+                and isinstance(candidate[0], str)
+            ):
+                yield candidate
+
+
+def ocr_margin_regions(
+    input_path: Path,
+    analyses: Sequence[object],
+    regions: Sequence[MarginOCRRegion],
+    *,
+    password: str | None = None,
+    rotations: Sequence[int] | None = None,
+    render_scale: float = MARGIN_OCR_RENDER_SCALE,
+    batch_size: int = MARGIN_OCR_MAX_BATCH_SIZE,
+) -> tuple[dict[str, list[tuple[str, float]]], MarginOCRSummary]:
+    """Read only explicitly requested page-margin crops.
+
+    This is intentionally a referee, not a second document parser.  Callers
+    supply small edge regions only after a reliable native pagination mapping
+    conflicts with the PDF's text layer.  Results remain raw OCR tokens so the
+    caller can reject anything ambiguous.
+    """
+
+    selected = tuple(regions)
+    if not 1 <= int(batch_size) <= MARGIN_OCR_MAX_BATCH_SIZE:
+        raise ValueError(
+            f"batch_size must be between 1 and {MARGIN_OCR_MAX_BATCH_SIZE}"
+        )
+    if float(render_scale) <= 0.0:
+        raise ValueError("render_scale must be positive")
+    keys = [region.key for region in selected]
+    if len(keys) != len(set(keys)):
+        raise ValueError("margin OCR region keys must be unique")
+    for region in selected:
+        if (
+            region.page_index < 0
+            or not 0.0 <= region.x0_ratio < region.x1_ratio <= 1.0
+            or not 0.0 <= region.top_ratio < region.bottom_ratio <= 1.0
+        ):
+            raise ValueError(f"invalid margin OCR region: {region.key}")
+
+    try:
+        version = metadata.version("rapidocr")
+    except metadata.PackageNotFoundError:
+        version = "unavailable"
+    engine_name = "RapidOCR (ONNX Runtime)"
+    if not selected:
+        return {}, MarginOCRSummary(
+            engine=engine_name,
+            version=version,
+            model_sha256="",
+            attempted_pages=(),
+            attempted_regions=(),
+            regions_with_words=(),
+            failed_regions=(),
+            batch_count=0,
+            render_scale=float(render_scale),
+            max_batch_size=int(batch_size),
+        )
+
+    analysis_by_page = {
+        int(getattr(analysis, "page_index")): analysis for analysis in analyses
+    }
+    missing = sorted(
+        {
+            region.page_index
+            for region in selected
+            if region.page_index not in analysis_by_page
+        }
+    )
+    if missing:
+        raise ValueError(f"Selected page indices are unavailable: {missing}")
+    if rotations is not None and max(region.page_index for region in selected) >= len(
+        rotations
+    ):
+        raise ValueError("rotations does not cover every selected page")
+
+    try:
+        import numpy as np
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError("The bundled local PDF renderer is unavailable") from exc
+    try:
+        import rapidocr
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        raise RuntimeError("The bundled local OCR engine is unavailable") from exc
+
+    started_at = perf_counter()
+    package_root = Path(rapidocr.__file__).resolve().parent
+    engine = RapidOCR(
+        params={
+            "Global.log_level": "error",
+            "Global.return_word_box": True,
+        }
+    )
+    regions_by_page: dict[int, list[MarginOCRRegion]] = {}
+    for region in selected:
+        regions_by_page.setdefault(region.page_index, []).append(region)
+    strips: list[_MarginOCRStrip] = []
+    failed_regions: set[str] = set()
+    render_seconds = 0.0
+    ocr_seconds = 0.0
+    batch_count = 0
+    document = pdfium.PdfDocument(str(input_path), password=password)
+    try:
+        if max(regions_by_page) >= len(document):
+            raise ValueError("Selected page index exceeds PDF page count")
+        for page_index in sorted(regions_by_page):
+            page_regions = regions_by_page[page_index]
+            render_started_at = perf_counter()
+            try:
+                page = document[page_index]
+                actual_rotation = int(page.get_rotation() or 0) % 360
+                expected_rotation = (
+                    int(rotations[page_index] or 0) % 360
+                    if rotations is not None
+                    else int(
+                        getattr(
+                            analysis_by_page[page_index],
+                            "rotation",
+                            actual_rotation,
+                        )
+                        or 0
+                    )
+                    % 360
+                )
+                if actual_rotation not in {0, 90, 180, 270}:
+                    raise ValueError("Unsupported PDF page rotation")
+                if expected_rotation != actual_rotation:
+                    raise ValueError(
+                        "Page rotation metadata does not match the renderer"
+                    )
+                bitmap = page.render(
+                    scale=float(render_scale),
+                    crop=(0.0, 0.0, 0.0, 0.0),
+                )
+                image = np.asarray(bitmap.to_pil().convert("RGB"))
+                if image.ndim != 3 or image.shape[0] <= 0 or image.shape[1] <= 0:
+                    raise ValueError("Margin crop rendered an empty image")
+                pixel_height, pixel_width = (
+                    int(image.shape[0]),
+                    int(image.shape[1]),
+                )
+                for region in page_regions:
+                    x0 = int(round(region.x0_ratio * pixel_width))
+                    x1 = int(round(region.x1_ratio * pixel_width))
+                    top = int(round(region.top_ratio * pixel_height))
+                    bottom = int(round(region.bottom_ratio * pixel_height))
+                    x0 = max(0, min(pixel_width - 1, x0))
+                    x1 = max(1, min(pixel_width, x1))
+                    top = max(0, min(pixel_height - 1, top))
+                    bottom = max(1, min(pixel_height, bottom))
+                    if x1 <= x0 or bottom <= top:
+                        failed_regions.add(region.key)
+                        continue
+                strips.append(
+                    _MarginOCRStrip(
+                        region=region,
+                        # Keep only the small crop. A NumPy view would retain
+                        # the full rendered page for the rest of OCR batching.
+                        image=image[top:bottom, x0:x1].copy(),
+                    )
+                )
+            except Exception:
+                failed_regions.update(region.key for region in page_regions)
+            finally:
+                render_seconds += perf_counter() - render_started_at
+
+        detected: dict[str, list[tuple[str, float]]] = {}
+        for chunk_start in range(0, len(strips), int(batch_size)):
+            chunk = strips[chunk_start : chunk_start + int(batch_size)]
+            if not chunk:
+                continue
+            max_height = max(int(strip.image.shape[0]) for strip in chunk)
+            total_width = sum(int(strip.image.shape[1]) for strip in chunk) + (
+                MARGIN_OCR_SEPARATOR_PIXELS * (len(chunk) - 1)
+            )
+            canvas = np.full((max_height, total_width, 3), 255, dtype=np.uint8)
+            cursor = 0
+            for strip in chunk:
+                strip.batch_left = cursor
+                strip_height, strip_width = strip.image.shape[:2]
+                canvas[:strip_height, cursor : cursor + strip_width] = strip.image
+                cursor += strip_width + MARGIN_OCR_SEPARATOR_PIXELS
+            batch_count += 1
+            ocr_started_at = perf_counter()
+            try:
+                result = engine(canvas, return_word_box=True)
+                for text, confidence, box in _iter_word_results(result):
+                    if len(box) < 4:
+                        continue
+                    try:
+                        center_x = sum(float(point[0]) for point in box) / len(box)
+                        score = float(confidence)
+                    except (
+                        IndexError,
+                        TypeError,
+                        ValueError,
+                        ZeroDivisionError,
+                    ):
+                        continue
+                    strip = next(
+                        (
+                            candidate
+                            for candidate in chunk
+                            if candidate.batch_left
+                            <= center_x
+                            < candidate.batch_left
+                            + int(candidate.image.shape[1])
+                        ),
+                        None,
+                    )
+                    if strip is None or score < MIN_WORD_CONFIDENCE:
+                        continue
+                    raw = str(text).strip()
+                    if raw:
+                        detected.setdefault(strip.region.key, []).append(
+                            (raw, round(score, 5))
+                        )
+            except Exception:
+                failed_regions.update(strip.region.key for strip in chunk)
+                for strip in chunk:
+                    detected.pop(strip.region.key, None)
+            finally:
+                ocr_seconds += perf_counter() - ocr_started_at
+    finally:
+        document.close()
+
+    model_sha256 = _model_fingerprint(package_root)
+    summary = MarginOCRSummary(
+        engine=engine_name,
+        version=version,
+        model_sha256=model_sha256,
+        attempted_pages=tuple(page + 1 for page in sorted(regions_by_page)),
+        attempted_regions=tuple(region.key for region in selected),
+        regions_with_words=tuple(sorted(detected)),
+        failed_regions=tuple(sorted(failed_regions)),
+        batch_count=batch_count,
+        render_scale=float(render_scale),
+        max_batch_size=int(batch_size),
+        render_seconds=round(render_seconds, 4),
+        ocr_seconds=round(ocr_seconds, 4),
+        total_seconds=round(perf_counter() - started_at, 4),
+    )
+    return detected, summary
 
 
 def _word_result_score(result: object) -> tuple[int, float]:

@@ -282,5 +282,77 @@ class NavigationOCRTests(unittest.TestCase):
             )
 
 
+    def test_margin_regions_batch_and_keep_results_isolated(self) -> None:
+        pages = [_FakePage(200.0, 100.0, 0, 20 + index) for index in range(5)]
+        analyses = [
+            SimpleNamespace(page_index=index, width=200.0, height=100.0, rotation=0)
+            for index in range(5)
+        ]
+        regions = [
+            local_ocr.MarginOCRRegion(
+                f"footer-{index}",
+                index,
+                0.25,
+                0.84,
+                0.75,
+                1.0,
+            )
+            for index in range(5)
+        ]
+        first_batch = [
+            ("101", 0.99, _box(5, 10, 50, 35)),
+            ("102", 0.98, _box(429, 10, 474, 35)),
+            ("103", 0.97, _box(853, 10, 898, 35)),
+            ("104", 0.96, _box(1277, 10, 1322, 35)),
+            ("separator", 0.99, _box(405, 10, 419, 35)),
+        ]
+        results = [
+            SimpleNamespace(word_results=(tuple(first_batch),)),
+            SimpleNamespace(word_results=((("105", 0.95, _box(5, 10, 50, 35)),),)),
+        ]
+
+        context, document, _ = self._module_context(pages, results)
+        with context:
+            ticks = iter(index / 10 for index in range(100))
+            with (
+                patch.object(
+                    local_ocr.metadata,
+                    "version",
+                    return_value="test-version",
+                ),
+                patch.object(
+                    local_ocr,
+                    "_model_fingerprint",
+                    return_value="model-hash",
+                ),
+                patch.object(
+                    local_ocr,
+                    "perf_counter",
+                    side_effect=lambda: next(ticks),
+                ),
+            ):
+                detected, summary = local_ocr.ocr_margin_regions(
+                    Path("fixture.pdf"),
+                    analyses,
+                    regions,
+                    password="secret",
+                    rotations=[0, 0, 0, 0, 0],
+                )
+
+        self.assertTrue(document.closed)
+        self.assertIn("footer-0", detected, summary.as_report())
+        self.assertEqual(detected["footer-0"], [("101", 0.99)])
+        self.assertEqual(detected["footer-4"], [("105", 0.95)])
+        self.assertNotIn("separator", [text for values in detected.values() for text, _ in values])
+        engine = _FakeRapidOCR.instances[0]
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(engine.calls[0].shape, (64, 1672, 3))
+        self.assertEqual(engine.calls[1].shape, (64, 400, 3))
+        self.assertEqual(summary.attempted_pages, (1, 2, 3, 4, 5))
+        self.assertEqual(summary.batch_count, 2)
+        self.assertEqual(summary.failed_regions, ())
+        self.assertEqual(summary.regions_with_words, tuple(f"footer-{index}" for index in range(5)))
+
+
 if __name__ == "__main__":
     unittest.main()
