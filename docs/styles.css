@@ -567,10 +567,12 @@ h3 {
 
 .ocr-statement {
   color: var(--accent);
-  font-size: clamp(4rem, 9vw, 8.5rem);
-  font-weight: 800;
-  line-height: 0.9;
-  letter-spacing: -0.075em;
+  max-width: 7ch;
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: clamp(3.4rem, 7.4vw, 7rem);
+  font-weight: 700;
+  line-height: 0.92;
+  letter-spacing: -0.065em;
 }
 
 .ocr-copy .note {
@@ -638,9 +640,15 @@ h3 {
 }
 
 .creator-section h2 {
-  max-width: 760px;
+  max-width: 860px;
   margin-bottom: 18px;
-  font-size: clamp(2.15rem, 4vw, 3.4rem);
+  font-size: clamp(2.15rem, 3.5vw, 3.2rem);
+}
+
+.creator-section .creator-signoff {
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
 }
 
 .site-footer {
@@ -785,7 +793,7 @@ h3 {
   }
 
   .ocr-statement {
-    font-size: clamp(4rem, 17vw, 7rem);
+    font-size: clamp(3.25rem, 14vw, 5.75rem);
   }
 }
 
