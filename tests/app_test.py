@@ -20,11 +20,16 @@ import uvicorn
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from interactive_pdf_app import jobs, worker
+from interactive_pdf_app import browser_launcher, jobs, worker
 from interactive_pdf_app.__main__ import BrowserSessionMonitor
+from interactive_pdf_app.browser_launcher import BrowserLaunch
 from interactive_pdf_app.jobs import EngineTimeoutError, JobManager, _safe_rmtree
 from interactive_pdf_app.models import AppError, ErrorCode, ErrorPayload, JobStatus
-from interactive_pdf_app.native_window import NativeController
+from interactive_pdf_app.native_window import (
+    LAUNCH_FAILED_STATUS,
+    READY_MESSAGE,
+    NativeController,
+)
 from interactive_pdf_app.server import _validated_filename, create_app
 from interactive_pdf_app.worker import _validated_job_directory, run_internal_worker
 from scripts import progress_events
@@ -188,6 +193,218 @@ class BrowserSessionMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.expired())
         now[0] = 30
         self.assertTrue(monitor.expired())
+
+
+class BrowserLaunchTests(unittest.TestCase):
+    """The launcher must prefer the user's default browser and stay honest."""
+
+    URL = "http://127.0.0.1:8765/#token=abc"
+
+    @staticmethod
+    def _opens(_url: str) -> bool:
+        return True
+
+    @staticmethod
+    def _refuses(_url: str) -> bool:
+        return False
+
+    @staticmethod
+    def _raises(_url: str) -> bool:
+        raise OSError("no application is associated with http")
+
+    def test_windows_order_asks_the_default_browser_first(self) -> None:
+        names = [name for name, _ in browser_launcher.default_strategies(windows=True)]
+        self.assertEqual(names[0], "windows-default-browser")
+        self.assertGreater(len(names), 1)
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_non_windows_keeps_the_standard_library_fallback(self) -> None:
+        self.assertEqual(
+            [name for name, _ in browser_launcher.default_strategies(windows=False)],
+            ["python-webbrowser"],
+        )
+
+    def test_first_working_strategy_wins_and_later_ones_never_run(self) -> None:
+        calls: list[str] = []
+
+        def first(url: str) -> bool:
+            calls.append("first")
+            return True
+
+        def second(url: str) -> bool:
+            calls.append("second")
+            return True
+
+        result = browser_launcher.open_workspace_url(
+            self.URL,
+            strategies=(("first", first), ("second", second)),
+        )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.method, "first")
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(result.help_text(), "")
+
+    def test_silent_refusal_and_os_error_fall_through_to_the_next_strategy(self) -> None:
+        result = browser_launcher.open_workspace_url(
+            self.URL,
+            strategies=(
+                ("silent", self._refuses),
+                ("raising", self._raises),
+                ("works", self._opens),
+            ),
+        )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.method, "works")
+
+    def test_total_failure_reports_the_cause_and_actionable_help(self) -> None:
+        result = browser_launcher.open_workspace_url(
+            self.URL,
+            strategies=(("silent", self._refuses), ("raising", self._raises)),
+        )
+
+        self.assertFalse(result.opened)
+        self.assertEqual(result.method, "")
+        self.assertIn("silent", result.detail)
+        self.assertIn("no application is associated with http", result.detail)
+        self.assertIn(self.URL, result.help_text())
+        self.assertIn("Default apps", result.help_text())
+
+    def test_missing_url_still_produces_actionable_help(self) -> None:
+        help_text = BrowserLaunch(opened=False, url="").help_text()
+        self.assertIn("Default apps", help_text)
+
+    def test_windows_strategy_defers_to_the_shell_association(self) -> None:
+        opened: list[str] = []
+        with patch.object(
+            browser_launcher.os,
+            "startfile",
+            opened.append,
+            create=True,
+        ):
+            self.assertTrue(browser_launcher._windows_shell_default(self.URL))  # noqa: SLF001
+        self.assertEqual(opened, [self.URL])
+
+    def test_standard_library_strategy_opens_a_new_tab(self) -> None:
+        with patch.object(
+            browser_launcher.webbrowser, "open", return_value=True
+        ) as opener:
+            self.assertTrue(browser_launcher._python_webbrowser(self.URL))  # noqa: SLF001
+        opener.assert_called_once_with(self.URL, new=2, autoraise=True)
+
+    def test_no_browser_is_hard_coded(self) -> None:
+        source = Path(browser_launcher.__file__).read_text(encoding="utf-8").casefold()
+        for browser_name in ("chrome", "msedge", "firefox", "iexplore", "safari"):
+            self.assertNotIn(browser_name, source)
+
+
+class _FakeVariable:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+
+class _FakeWidget:
+    def __init__(self) -> None:
+        self.options: dict[str, object] = {}
+
+    def configure(self, **options: object) -> None:
+        self.options.update(options)
+
+
+class _AliveThread:
+    @staticmethod
+    def is_alive() -> bool:
+        return True
+
+
+class _StartedServer:
+    started = True
+
+
+class ControllerLaunchFeedbackTests(unittest.TestCase):
+    """A failed browser launch must surface in the controller, not vanish."""
+
+    def _controller(self, open_workspace) -> NativeController:  # type: ignore[no-untyped-def]
+        controller = NativeController.__new__(NativeController)
+        controller.closing = False
+        controller.launch_failed = False
+        controller._launch_guard = threading.Lock()  # noqa: SLF001
+        controller._launch_result = None  # noqa: SLF001
+        controller.open_workspace = open_workspace
+        controller.has_active_job = lambda: False
+        controller.opened_automatically = True
+        controller.server = _StartedServer()
+        controller.server_thread = _AliveThread()
+        controller.theme = "light"
+        controller.status_kind = "good"
+        controller.status_text = _FakeVariable()
+        controller.message_text = _FakeVariable(READY_MESSAGE)
+        controller.status_dot = _FakeWidget()
+        controller.open_button = _FakeWidget()
+        controller.root = _FakeWidget()
+        controller.root.after = lambda *_args: None  # type: ignore[attr-defined]
+        return controller
+
+    def test_successful_launch_keeps_the_normal_message(self) -> None:
+        launch = BrowserLaunch(opened=True, url="http://127.0.0.1:1/", method="test")
+        controller = self._controller(lambda: launch)
+
+        controller._open_and_record()  # noqa: SLF001 - thread body run inline
+        controller._poll_server()  # noqa: SLF001
+
+        self.assertFalse(controller.launch_failed)
+        self.assertEqual(controller.message_text.get(), READY_MESSAGE)
+        self.assertEqual(controller.status_text.get(), "Local processor is running")
+
+    def test_failed_launch_shows_the_address_and_a_warning_status(self) -> None:
+        url = "http://127.0.0.1:8765/#token=abc"
+        launch = BrowserLaunch(opened=False, url=url, detail="nothing responded")
+        controller = self._controller(lambda: launch)
+
+        controller._open_and_record()  # noqa: SLF001 - thread body run inline
+        controller._poll_server()  # noqa: SLF001
+
+        self.assertTrue(controller.launch_failed)
+        self.assertIn(url, controller.message_text.get())
+        self.assertEqual(controller.status_text.get(), LAUNCH_FAILED_STATUS)
+        self.assertEqual(controller.open_button.options.get("state"), "normal")
+
+    def test_unexpected_launcher_error_is_reported_instead_of_lost(self) -> None:
+        def explode() -> BrowserLaunch:
+            raise RuntimeError("shell unavailable")
+
+        controller = self._controller(explode)
+
+        controller._open_and_record()  # noqa: SLF001 - thread body run inline
+        controller._poll_server()  # noqa: SLF001
+
+        self.assertTrue(controller.launch_failed)
+        self.assertIn("Default apps", controller.message_text.get())
+
+    def test_a_later_successful_launch_clears_the_failure_message(self) -> None:
+        url = "http://127.0.0.1:8765/#token=abc"
+        results = [
+            BrowserLaunch(opened=False, url=url, detail="nothing responded"),
+            BrowserLaunch(opened=True, url=url, method="test"),
+        ]
+        controller = self._controller(lambda: results.pop(0))
+
+        controller._open_and_record()  # noqa: SLF001
+        controller._poll_server()  # noqa: SLF001
+        self.assertTrue(controller.launch_failed)
+
+        controller._open_and_record()  # noqa: SLF001
+        controller._poll_server()  # noqa: SLF001
+
+        self.assertFalse(controller.launch_failed)
+        self.assertEqual(controller.message_text.get(), READY_MESSAGE)
 
 
 class NativeControllerTests(unittest.TestCase):

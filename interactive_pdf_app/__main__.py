@@ -5,18 +5,16 @@ from __future__ import annotations
 import argparse
 import http.client
 import os
-import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
 import uvicorn
 
+from .browser_launcher import open_workspace_url
 from .server import create_app, new_api_token
 
 
@@ -67,73 +65,6 @@ def _stop_when_browser_inactive(
         time.sleep(1.0)
 
 
-def _registered_chrome() -> Path | None:
-    if os.name != "nt":
-        return None
-    try:
-        import winreg
-    except ImportError:
-        return None
-
-    registry_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
-    roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
-    access_modes = [winreg.KEY_READ]
-    for attribute in ("KEY_WOW64_64KEY", "KEY_WOW64_32KEY"):
-        value = getattr(winreg, attribute, 0)
-        if value:
-            access_modes.append(winreg.KEY_READ | value)
-    for root in roots:
-        for access in access_modes:
-            try:
-                with winreg.OpenKey(root, registry_path, 0, access) as key:
-                    raw, _ = winreg.QueryValueEx(key, None)
-                candidate = Path(str(raw)).expanduser()
-                if candidate.is_file():
-                    return candidate.resolve()
-            except OSError:
-                continue
-    return None
-
-
-def _find_chrome() -> Path | None:
-    """Prefer installed Chrome so the user's existing session is reused."""
-
-    registered = _registered_chrome()
-    if registered is not None:
-        return registered
-    candidates: list[Path] = []
-    for environment_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
-        root = os.environ.get(environment_name)
-        if root:
-            candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
-    on_path = shutil.which("chrome.exe") or shutil.which("chrome")
-    if on_path:
-        candidates.append(Path(on_path))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _open_in_browser(url: str) -> bool:
-    chrome = _find_chrome()
-    if chrome is not None:
-        try:
-            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            subprocess.Popen(
-                [str(chrome), "--new-tab", url],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                creationflags=creation_flags,
-            )
-            return True
-        except OSError:
-            pass
-    return bool(webbrowser.open(url, new=2, autoraise=True))
-
-
 def _open_when_ready(port: int, url: str) -> None:
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
@@ -143,13 +74,13 @@ def _open_when_ready(port: int, url: str) -> None:
             response = connection.getresponse()
             response.read()
             if response.status == 200:
-                _open_in_browser(url)
+                open_workspace_url(url)
                 return
         except OSError:
             time.sleep(0.1)
         finally:
             connection.close()
-    _open_in_browser(url)
+    open_workspace_url(url)
 
 
 def _bound_listener(port: int) -> tuple[socket.socket, int]:
@@ -240,7 +171,7 @@ def _run_with_native_controller(
         run_native_controller(
             server=server,
             server_thread=server_thread,
-            open_workspace=lambda: _open_in_browser(url),
+            open_workspace=lambda: open_workspace_url(url),
             has_active_job=lambda: bool(manager.has_active_job),
             icon_png=root / "Icon" / "Make Interactive PDFs.png",
             icon_ico=root / "Icon" / "Make Interactive PDFs.ico",

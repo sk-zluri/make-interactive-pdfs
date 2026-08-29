@@ -14,11 +14,17 @@ from typing import Literal
 import uvicorn
 
 from . import __version__
+from .browser_launcher import BrowserLaunch
 
 
 WINDOW_TITLE = "Make Interactive PDFs"
 LINKEDIN_URL = "https://www.linkedin.com/in/techhfreakk"
 SHUTDOWN_WINDOW_SECONDS = 20.0
+READY_MESSAGE = (
+    "Your PDF workspace opens in your default browser. Keep this window open "
+    "while you work—your files are processed privately on this computer."
+)
+LAUNCH_FAILED_STATUS = "Open your browser manually to continue"
 
 ThemeName = Literal["light", "dark"]
 StatusKind = Literal["good", "warning", "error"]
@@ -173,7 +179,7 @@ class NativeController:
         *,
         server: uvicorn.Server,
         server_thread: threading.Thread,
-        open_workspace: Callable[[], bool],
+        open_workspace: Callable[[], BrowserLaunch],
         has_active_job: Callable[[], bool],
         icon_png: Path | None = None,
         icon_ico: Path | None = None,
@@ -188,6 +194,11 @@ class NativeController:
         self.opened_automatically = False
         self.theme: ThemeName = _system_theme()
         self.status_kind: StatusKind = "good"
+        self.launch_failed = False
+        # Launches run off the UI thread; the existing poll loop applies the
+        # result so no Tk widget is ever touched from a worker thread.
+        self._launch_guard = threading.Lock()
+        self._launch_result: BrowserLaunch | None = None
 
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
@@ -216,12 +227,7 @@ class NativeController:
                 self._header_icon = None
 
         self.status_text = tk.StringVar(value="Starting local processor…")
-        self.message_text = tk.StringVar(
-            value=(
-                "Your PDF workspace will open in Chrome. Keep this window open "
-                "while you work—your files are processed privately on this computer."
-            )
-        )
+        self.message_text = tk.StringVar(value=READY_MESSAGE)
 
         self.body = tk.Frame(self.root)
         self.body.pack(fill="both", expand=True, padx=36, pady=(28, 24))
@@ -484,10 +490,27 @@ class NativeController:
         if self.closing or not self.server_thread.is_alive():
             return
         threading.Thread(
-            target=self.open_workspace,
+            target=self._open_and_record,
             name="open-pdf-workspace",
             daemon=True,
         ).start()
+
+    def _open_and_record(self) -> None:
+        try:
+            result = self.open_workspace()
+        except Exception as error:  # noqa: BLE001 - a click must never be lost
+            result = BrowserLaunch(opened=False, url="", detail=str(error))
+        with self._launch_guard:
+            self._launch_result = result
+
+    def _consume_launch_result(self) -> None:
+        with self._launch_guard:
+            result = self._launch_result
+            self._launch_result = None
+        if result is None:
+            return
+        self.launch_failed = not result.opened
+        self.message_text.set(result.help_text() if self.launch_failed else READY_MESSAGE)
 
     def _destroy_root(self) -> None:
         try:
@@ -525,7 +548,10 @@ class NativeController:
             if not self.opened_automatically:
                 self.opened_automatically = True
                 self._open_in_background()
-            if self.has_active_job():
+            self._consume_launch_result()
+            if self.launch_failed:
+                self._set_status("warning", LAUNCH_FAILED_STATUS)
+            elif self.has_active_job():
                 self._set_status("good", "Processing PDF locally…")
             else:
                 self._set_status("good", "Local processor is running")
@@ -557,7 +583,7 @@ def run_native_controller(
     *,
     server: uvicorn.Server,
     server_thread: threading.Thread,
-    open_workspace: Callable[[], bool],
+    open_workspace: Callable[[], BrowserLaunch],
     has_active_job: Callable[[], bool],
     icon_png: Path | None,
     icon_ico: Path | None,

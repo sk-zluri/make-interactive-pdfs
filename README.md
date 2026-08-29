@@ -23,7 +23,7 @@ It can add:
 2. Download `Make.Interactive.PDFs.zip`.
 3. Extract the entire ZIP folder.
 4. Double-click `Make Interactive PDFs.exe`.
-5. Keep the small desktop controller open while using the workspace in Chrome.
+5. Keep the small desktop controller open while using the workspace in your default browser.
 
 The app is not code-signed yet, so Windows may show a SmartScreen warning. Only continue if you downloaded it from this repository's official Releases page.
 

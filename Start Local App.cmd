@@ -18,7 +18,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Starting the local PDF tool in Chrome...
+echo Starting the local PDF tool in your default browser...
 echo Keep this window open while you use the app.
 echo Press Ctrl+C here when you are finished.
 echo.
